@@ -1,0 +1,22 @@
+---
+server:
+  listen: "0.0.0.0"
+
+backend:
+  backend_name: netbox
+  base_url: http://localhost:8080
+  auth_token: 215e4324a3a621a5ea1619d6c08c6d3b90bf19c9
+
+# backend:
+#   backend_name: memory
+#   scope:
+#     - 172.21.0.240
+#     - 172.21.0.250
+#   gateway: 172.21.0.1
+#   subnet_mask: 255.255.255.0
+#   dns_servers:
+#     - 172.21.0.1
+#   domain_name: portman.int
+#   domain_search:
+#     - portman.int
+#     - portman.net.au

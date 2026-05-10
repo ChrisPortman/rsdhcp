@@ -1,0 +1,52 @@
+stages:
+  - first
+  - second
+
+variables:
+  PACKAGE_REGISTRY_URL: "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/releases"
+
+lint:
+  stage: first
+  image: rust:latest
+  script:
+    - rustup component add clippy
+    - cd rsdhcp
+    - cargo clippy --all-targets --all-features -- -D warnings
+    - cd ../rsdhcp_macros
+    - cargo clippy --all-targets --all-features -- -D warnings
+
+test:
+  stage: first
+  image: rust:latest
+  script:
+    - cd rsdhcp
+    - cargo test
+    - cd ../rsdhcp_macros
+    - cargo test
+
+compile:
+  stage: second
+  image: rust:latest
+  script:
+    - cd rsdhcp
+    - cargo build --release
+  artifacts:
+    paths:
+      - rsdhcp/target/release/rsdhcp
+    expire_in: 2 days
+
+docker-image:
+  stage: second
+  image: "${DOCKER_BUILDER_IMAGE}"
+  script:
+    - echo "$CI_REGISTRY_PASSWORD" | buildah login $CI_REGISTRY -u
+      $CI_REGISTRY_USER --password-stdin
+    - buildah build -t
+      ${CI_REGISTRY}/${CI_PROJECT_NAMESPACE}/${CI_PROJECT_NAME}:latest
+      --build-arg=HTTP_PROXY="${HTTP_PROXY}"
+      --build-arg=HTTPS_PROXY="${HTTP_PROXY}" --build-arg=NO_PROXY="${NO_PROXY}"
+      .
+    - buildah push
+      ${CI_REGISTRY}/${CI_PROJECT_NAMESPACE}/${CI_PROJECT_NAME}:latest
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
