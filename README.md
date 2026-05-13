@@ -3,7 +3,7 @@
 ## Introduction
 
 This is a re-imagining of [pyDHCP](https://github.com/ChrisPortman/pydhcp) developed in Rust
-specifically to integrate with [Netbox](https://docs.netbox.dev/en/stable/) via the [netbox-dhcp](https://comming.soon)
+specifically to integrate with [Netbox](https://docs.netbox.dev/en/stable/) via the [netbox-dhcp](https://github.com/ChrisPortman/netbox-dhcp)
 plugin for DHCP lease information.
 
 ## Building
