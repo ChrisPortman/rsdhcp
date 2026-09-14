@@ -156,6 +156,10 @@ impl DhcpPacket {
             options: DhcpOptions::new(None),
         };
 
+        if packet.cookie != COOKIE {
+            return Err(PacketError::new("Invalid DHCP packet - incorrect cookie"));
+        }
+
         if raw.len() > 240 {
             packet.options = DhcpOptions::from_network(&raw[240..])?;
         }
