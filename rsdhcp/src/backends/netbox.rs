@@ -68,7 +68,7 @@ struct NetboxOptions {
     domain_name: Option<String>,
     boot_file: Option<String>,
     boot_server: Option<Ipv4Addr>,
-    grub_default: Option<String>,
+    grub_default: Option<Vec<u8>>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

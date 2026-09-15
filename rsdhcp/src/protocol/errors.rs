@@ -41,3 +41,11 @@ impl From<std::array::TryFromSliceError> for PacketError {
         }
     }
 }
+
+impl From<std::io::Error> for PacketError {
+    fn from(err: std::io::Error) -> Self {
+        Self {
+            error: err.to_string(),
+        }
+    }
+}

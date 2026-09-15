@@ -1,7 +1,9 @@
 use std::fmt;
 use std::fmt::{Display, Formatter};
+use std::io::Cursor;
 use std::net::Ipv4Addr;
 
+use byteorder::ReadBytesExt;
 use log::warn;
 
 use crate::backends::Lease;
@@ -43,8 +45,8 @@ impl DhcpPacket {
         };
 
         let mut msg_type = enums::MessageType::Unknown(255);
-        if let Some(DhcpOption::DhcpMsgType(o)) = src.get_option(DhcpOption::DHCPMSGTYPE) {
-            match enums::MessageType::from(o) {
+        if let Some(DhcpOption::DhcpMsgType(mt)) = src.get_option(DhcpOption::DHCPMSGTYPE) {
+            match mt {
                 enums::MessageType::Discover => msg_type = enums::MessageType::Offer,
                 enums::MessageType::Request => msg_type = enums::MessageType::Acknowledge,
                 enums::MessageType::Inform => msg_type = enums::MessageType::Acknowledge,
@@ -93,9 +95,7 @@ impl DhcpPacket {
             new.options.options.push(DhcpOption::AddressTime(lease_val));
         }
 
-        new.options
-            .options
-            .push(DhcpOption::DhcpMsgType(msg_type.into()));
+        new.options.options.push(DhcpOption::DhcpMsgType(msg_type));
 
         new
     }
@@ -125,9 +125,7 @@ impl DhcpPacket {
             options: DhcpOptions::new(None),
         };
 
-        new.options
-            .options
-            .push(DhcpOption::DhcpMsgType(msg_type.into()));
+        new.options.options.push(DhcpOption::DhcpMsgType(msg_type));
 
         new
     }
@@ -135,7 +133,11 @@ impl DhcpPacket {
     /// Deserialze a DHCP packet from the provided byte slice.  E.g. bytes read
     /// from a UDP socket.
     pub fn from_network(raw: &[u8]) -> Result<Self, PacketError> {
-        Ok(Self {
+        if raw.len() < 240 {
+            return Err(PacketError::new("insufficient bytes in packet"));
+        }
+
+        let mut packet = Self {
             op: enums::DhcpOperation::from(raw[0]),
             htype: enums::HardwareType::from(raw[1]),
             hlen: raw[2],
@@ -151,8 +153,18 @@ impl DhcpPacket {
             sname: raw[44..108].try_into()?,
             file: raw[108..236].try_into()?,
             cookie: raw[236..240].try_into()?,
-            options: DhcpOptions::from_network(&raw[240..])?,
-        })
+            options: DhcpOptions::new(None),
+        };
+
+        if packet.cookie != COOKIE {
+            return Err(PacketError::new("Invalid DHCP packet - incorrect cookie"));
+        }
+
+        if raw.len() > 240 {
+            packet.options = DhcpOptions::from_network(&raw[240..])?;
+        }
+
+        Ok(packet)
     }
 
     /// Serialize the DhcpPacket to bytes that can be written to a UDP socket.
@@ -190,7 +202,7 @@ impl DhcpPacket {
     pub fn message_type(&self) -> Option<enums::MessageType> {
         for o in &self.options.options {
             if let DhcpOption::DhcpMsgType(o) = o {
-                return Some(enums::MessageType::from(o));
+                return Some(*o);
             }
         }
         None
@@ -249,8 +261,8 @@ impl Display for DhcpPacket {
         let file = std::str::from_utf8(&self.file).unwrap_or("");
 
         let mut msg_type = enums::MessageType::Unknown(255);
-        if let Some(DhcpOption::DhcpMsgType(o)) = self.get_option(DhcpOption::DHCPMSGTYPE) {
-            msg_type = enums::MessageType::from(o);
+        if let Some(DhcpOption::DhcpMsgType(mt)) = self.get_option(DhcpOption::DHCPMSGTYPE) {
+            msg_type = *mt
         }
 
         writeln!(f)?;
@@ -291,38 +303,35 @@ impl DhcpOptions {
     /// Deserialize option from a byte slice.  Typcially end users won't use this, it
     /// is used by the `from_network` method of the `DhcpPacket`.
     pub fn from_network(raw: &[u8]) -> Result<Self, PacketError> {
+        if raw.is_empty() {
+            return Ok(Self::new(None));
+        }
+
+        let mut cursor = Cursor::new(raw);
         let mut options = Self { options: vec![] };
-        let mut offset = 0;
-        let last_idx = raw.len() - 1;
 
         loop {
-            if last_idx < offset {
-                return Err(PacketError::new("Malformed packet"));
-            }
-
-            let code: u8 = raw[offset];
+            let code: u8 = cursor.read_u8()?;
             if code == 255 {
                 break;
             }
 
             if code == 0 {
-                offset += 1;
                 continue;
             }
 
-            if last_idx < offset + 1 {
-                return Err(PacketError::new("Malformed packet"));
+            let length = cursor.read_u8()? as usize;
+            let start = cursor.position() as usize;
+            let end = start + length;
+
+            if end > cursor.get_ref().len() {
+                return Err(PacketError::new("Malformed Packet"));
             }
-            let length = raw[offset + 1] as usize;
 
-            if last_idx < offset + length {
-                return Err(PacketError::new("Malformed packet"));
-            }
-            let data: Vec<u8> = raw[2 + offset..2 + offset + length].to_vec();
+            let option_data = &cursor.get_ref()[start..end];
+            cursor.set_position(end as u64);
 
-            offset += 2 + length;
-
-            let option = match DhcpOption::new(&code, &data) {
+            let option = match DhcpOption::new(&code, option_data) {
                 Ok(o) => o,
                 Err(e) => {
                     warn!("Failed to decode data for option code {}: {}", code, e);
@@ -363,6 +372,9 @@ impl Display for DhcpOptions {
 
 #[cfg(test)]
 mod tests {
+    use std::panic::catch_unwind;
+
+    use crate::protocol::enums::MessageType;
     use crate::protocol::option::DhcpOption;
     use crate::protocol::packet;
     use std::fs;
@@ -400,5 +412,50 @@ mod tests {
         if let Some(DhcpOption::DhcpMsgType(opt)) = opt {
             println!("Option data: {:#?}", opt);
         }
+    }
+
+    fn packet_with_options(options: &[u8]) -> Vec<u8> {
+        let mut packet = vec![0u8; 240];
+        packet[236..240].copy_from_slice(&[99, 130, 83, 99]);
+        packet.extend_from_slice(options);
+        packet
+    }
+
+    #[test]
+    fn rejects_short_fixed_header_without_panicking() {
+        let result = catch_unwind(|| packet::DhcpPacket::from_network(&[0u8; 239]));
+
+        assert!(result.is_ok(), "short packet caused a panic");
+        assert!(result.unwrap().is_err());
+    }
+
+    #[test]
+    fn rejects_empty_options_without_panicking() {
+        let raw = packet_with_options(&[]);
+        let result = catch_unwind(|| packet::DhcpPacket::from_network(&raw));
+
+        assert!(result.is_ok(), "empty option area caused a panic");
+        assert!(result.unwrap().unwrap().options.options.is_empty());
+    }
+
+    #[test]
+    fn rejects_truncated_option_payload_without_panicking() {
+        // Option 1 claims two payload bytes but only one is present.
+        let raw = packet_with_options(&[1, 2, 0]);
+        let result = catch_unwind(|| packet::DhcpPacket::from_network(&raw));
+
+        assert!(result.is_ok(), "truncated option caused a panic");
+        assert!(result.unwrap().is_err());
+    }
+
+    #[test]
+    fn generated_option_decoder_accepts_a_valid_encoded_option() {
+        let result = catch_unwind(|| DhcpOption::from_network(&[53, 1, 1]));
+
+        assert!(result.is_ok(), "encoded option caused a panic");
+        assert!(matches!(
+            result.unwrap(),
+            Ok(DhcpOption::DhcpMsgType(MessageType::Discover))
+        ));
     }
 }

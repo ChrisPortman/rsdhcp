@@ -28,13 +28,11 @@ pub fn dhcp_options(input: TokenStream) -> TokenStream {
             variant_idents.push(v.ident.clone())
         }
 
-        let to_network_matches = quote! {
-            #(Self::#variant_idents(o) => o.to_network()),*
-        };
-
         let mut code_consts: Vec<TokenStream2> = vec![];
         let mut to_code_matches: Vec<TokenStream2> = vec![];
+        let mut to_network_matches: Vec<TokenStream2> = vec![];
         let mut new_matches: Vec<TokenStream2> = vec![];
+
         for v in &d.variants {
             let ident = &v.ident;
             let vtype = match &v.fields {
@@ -42,21 +40,39 @@ pub fn dhcp_options(input: TokenStream) -> TokenStream {
                 _ => None,
             };
 
-            let vtype_field = vtype.unwrap().ty.to_token_stream(); //.replace("\"", "");
-
             let ident_const =
                 syn::Ident::new(ident.to_string().to_uppercase().as_str(), ident.span());
-            // print!("vtype for {}: {}\n\n", ident_const, vtype_field);
+
             if let Some(code) = variant_code(v) {
                 code_consts.push(quote! {
                     pub const #ident_const: u8 = #code
                 });
-                to_code_matches.push(quote! {
-                    Self::#ident(_) => #code
-                });
-                new_matches.push(quote! {
-                    #code => #name::#ident(<#vtype_field>::from_network(data)?)
-                });
+
+                match vtype {
+                    Some(vt) => {
+                        let vtype_field = vt.ty.to_token_stream();
+                        new_matches.push(quote! {
+                            #code => #name::#ident(<#vtype_field>::from_network(data)?)
+                        });
+                        to_code_matches.push(quote! {
+                            Self::#ident(_) => #code
+                        });
+                        to_network_matches.push(quote! {
+                            Self::#ident(o) => Some(o.to_network()),
+                        });
+                    }
+                    None => {
+                        new_matches.push(quote! {
+                            #code => #name::#ident
+                        });
+                        to_code_matches.push(quote! {
+                            Self::#ident => #code
+                        });
+                        to_network_matches.push(quote! {
+                            Self::#ident => None,
+                        });
+                    }
+                };
             }
         }
 
@@ -79,20 +95,46 @@ pub fn dhcp_options(input: TokenStream) -> TokenStream {
                 }
 
                 pub fn to_network(&self) -> Vec<u8> {
-                    let mut bytes: Vec<u8> = match self {
-                        #to_network_matches
+                    let mut bytes: Option<Vec<u8>> = match self {
+                        #(#to_network_matches)*
                     };
 
-                    let mut result: Vec<u8> = vec![self.code(), bytes.len() as u8];
-                    result.append(&mut bytes);
+                    let result = match bytes {
+                        Some(mut b) => {
+                            let mut r: Vec<u8> = vec![self.code(), b.len() as u8];
+                            r.append(&mut b);
+                            r
+                        },
+                        None => vec![self.code()],
+                    };
+
                     result
                 }
 
                 pub fn from_network(data: &[u8]) -> Result<Self, PacketError> {
-                    let code = data[0];
-                    let len = data[1] as usize;
+                    if data.len() < 1 {
+                        return Err(PacketError::new("Malformed Option"));
+                    }
 
-                    Self::new(&code, &data[2..len])
+                    let code = data[0];
+                    match code {
+                        0 => return Self::new(&code, &[]),
+                        255 => return Self::new(&code, &[]),
+                        _ => {},
+                    };
+
+                    if data.len() < 2 {
+                        return Err(PacketError::new("Malformed Option"));
+                    }
+
+                    let len = data[1] as usize;
+                    let end = 2 + len;
+
+                    if data.len() < end {
+                        return Err(PacketError::new("Malformed Option"));
+                    }
+
+                    Self::new(&code, &data[2..end])
                 }
             }
         };

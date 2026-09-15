@@ -29,7 +29,7 @@ impl From<DhcpOperation> for u8 {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub enum MessageType {
     Discover,
     Offer,
@@ -70,6 +70,22 @@ impl From<MessageType> for u8 {
             MessageType::Release => 7,
             MessageType::Inform => 8,
             MessageType::Unknown(value) => value,
+        }
+    }
+}
+
+impl From<&MessageType> for u8 {
+    fn from(value: &MessageType) -> Self {
+        match value {
+            MessageType::Discover => 1,
+            MessageType::Offer => 2,
+            MessageType::Request => 3,
+            MessageType::Decline => 4,
+            MessageType::Acknowledge => 5,
+            MessageType::NegAcknowledge => 6,
+            MessageType::Release => 7,
+            MessageType::Inform => 8,
+            MessageType::Unknown(value) => *value,
         }
     }
 }
