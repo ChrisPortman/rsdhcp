@@ -2,9 +2,10 @@
 //! `netbox-dhcp` plugin installed.
 use std::io::Write;
 use std::net::Ipv4Addr;
+use std::ops::Add;
 
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use ipnet::Ipv4Net;
 use log::info;
 use reqwest;
@@ -27,6 +28,10 @@ struct NetboxDhcpLeaseRequest {
     requested_ip: Option<Ipv4Addr>,
     hostname: Option<String>,
 }
+
+const DECLINED_CLIENT_ID: &str = "DECLINED";
+const DECLINED_HOSTNAME: &str = "DECLINED";
+const DECLINED_MAC_ADDRESS: &str = "00:00:00:00:00:00";
 
 impl From<&packet::DhcpPacket> for NetboxDhcpLeaseRequest {
     fn from(item: &packet::DhcpPacket) -> Self {
@@ -90,22 +95,28 @@ struct NetboxDhcpLease {
 
 impl NetboxDhcpLease {
     async fn acknowledge(&mut self, client: &Client) -> Result<(), BackendError> {
+        self.acknowledged = false;
+
+        self.save(client).await?;
         self.acknowledged = true;
 
-        match send_request(client.put(&self.url).json(&self)).await {
-            Ok(_) => Ok(()),
-            Err(e) => {
-                self.acknowledged = false;
-                Err(e)
-            }
-        }
+        Ok(())
+    }
+
+    async fn decline(&mut self, client: &Client) -> Result<(), BackendError> {
+        self.client_id = String::from(DECLINED_CLIENT_ID);
+        self.hostname = Some(String::from(DECLINED_HOSTNAME));
+        self.mac_address = String::from(DECLINED_MAC_ADDRESS);
+        self.expire_time = Utc::now().add(Duration::hours(1));
+
+        self.save(client).await?;
+
+        Ok(())
     }
 
     async fn delete(&mut self, client: &Client) -> Result<(), BackendError> {
-        match send_request(client.delete(&self.url)).await {
-            Ok(_) => Ok(()),
-            Err(e) => Err(e),
-        }
+        send_request(client.delete(&self.url)).await?;
+        Ok(())
     }
 
     fn update_from_packet(&mut self, packet: &packet::DhcpPacket) {
@@ -116,6 +127,11 @@ impl NetboxDhcpLease {
         if let Some(DhcpOption::ClientId(client_id)) = packet.get_option(DhcpOption::CLIENTID) {
             self.client_id = u8_to_hex(client_id);
         };
+    }
+
+    async fn save(&self, client: &Client) -> Result<(), BackendError> {
+        send_request(client.put(&self.url).json(&self)).await?;
+        Ok(())
     }
 }
 
@@ -360,6 +376,24 @@ impl Netbox {
         Ok(())
     }
 
+    async fn decline_lease(&self, packet: &packet::DhcpPacket) -> Result<(), BackendError> {
+        let client_id = Self::get_client_id(packet);
+        let existing_leases = self.get_leases_for_client_id(&client_id).await?;
+
+        let declined_addr = match packet.get_option(DhcpOption::ADDRESSREQUEST) {
+            Some(DhcpOption::AddressRequest(addr)) => *addr,
+            _ => return Ok(()),
+        };
+
+        for mut l in existing_leases {
+            if l.ip_address.address.addr() == declined_addr {
+                l.decline(&self.client).await?;
+            }
+        }
+
+        Ok(())
+    }
+
     fn get_client_id(packet: &packet::DhcpPacket) -> String {
         if let Some(DhcpOption::ClientId(cid)) = packet.get_option(DhcpOption::CLIENTID) {
             u8_to_hex(cid)
@@ -421,7 +455,7 @@ impl DhcpStore for Netbox {
     }
 
     async fn handle_decline(&self, packet: &packet::DhcpPacket) -> Result<(), BackendError> {
-        self.delete_lease(packet).await
+        self.decline_lease(packet).await
     }
 
     async fn handle_inform(
