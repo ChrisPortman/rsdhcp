@@ -1,5 +1,6 @@
 //! Use netbox for lease management.  Requres that the Netbox installation has the
 //! `netbox-dhcp` plugin installed.
+use std::cmp;
 use std::io::Write;
 use std::net::Ipv4Addr;
 use std::ops::Add;
@@ -37,9 +38,9 @@ impl From<&packet::DhcpPacket> for NetboxDhcpLeaseRequest {
     fn from(item: &packet::DhcpPacket) -> Self {
         let receiving_ip = item.giaddr;
 
-        let client_id: Vec<u8> = match item.get_option(DhcpOption::CLIENTID) {
-            Some(DhcpOption::ClientId(o)) => o.clone(),
-            _ => item.chaddr[0..6].to_vec(),
+        let client_id: &Vec<u8> = match item.get_option(DhcpOption::CLIENTID) {
+            Some(DhcpOption::ClientId(o)) => o,
+            _ => &item.chaddr[0..6].to_vec(),
         };
 
         let requested_ip = match item.get_option(DhcpOption::ADDRESSREQUEST) {
@@ -52,9 +53,11 @@ impl From<&packet::DhcpPacket> for NetboxDhcpLeaseRequest {
             _ => None,
         };
 
+        let hlen = cmp::min(usize::from(item.hlen), item.chaddr.len());
+
         NetboxDhcpLeaseRequest {
-            mac_address: u8_to_hex(&item.chaddr[0..6]),
-            client_id: u8_to_hex(&client_id),
+            mac_address: u8_to_hex(&item.chaddr[0..hlen]),
+            client_id: u8_to_hex(client_id),
             receiving_ip,
             requested_ip,
             hostname,
@@ -395,10 +398,12 @@ impl Netbox {
     }
 
     fn get_client_id(packet: &packet::DhcpPacket) -> String {
-        if let Some(DhcpOption::ClientId(cid)) = packet.get_option(DhcpOption::CLIENTID) {
-            u8_to_hex(cid)
-        } else {
-            u8_to_hex(&packet.chaddr[0..6])
+        match packet.get_option(DhcpOption::CLIENTID) {
+            Some(DhcpOption::ClientId(cid)) => u8_to_hex(cid),
+            _ => {
+                let len = cmp::min(usize::from(packet.hlen), packet.chaddr.len());
+                u8_to_hex(&packet.chaddr[0..len])
+            }
         }
     }
 }

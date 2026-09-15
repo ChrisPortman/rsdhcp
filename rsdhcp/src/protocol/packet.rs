@@ -97,6 +97,11 @@ impl DhcpPacket {
 
         new.options.options.push(DhcpOption::DhcpMsgType(msg_type));
 
+        // Echo back options in the incomming packet as required by the RFC
+        if let Some(o) = src.get_option(DhcpOption::CLIENTID) {
+            new.options.options.push(o.clone());
+        }
+
         new
     }
 
