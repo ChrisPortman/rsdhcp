@@ -38,12 +38,6 @@ impl DhcpPacket {
     /// Given a DhcpPacket and a lease, generate the appropriate response packet
     /// according to DHCP specified symantics.
     pub fn response(src: &DhcpPacket, lease: Lease) -> Self {
-        let op = match src.op {
-            enums::DhcpOperation::BootRequest => enums::DhcpOperation::BootReply,
-            enums::DhcpOperation::BootReply => enums::DhcpOperation::BootRequest,
-            enums::DhcpOperation::Unknown(i) => enums::DhcpOperation::Unknown(i),
-        };
-
         let mut msg_type = enums::MessageType::Unknown(255);
         if let Some(DhcpOption::DhcpMsgType(mt)) = src.get_option(DhcpOption::DHCPMSGTYPE) {
             match mt {
@@ -55,12 +49,12 @@ impl DhcpPacket {
         }
 
         let mut new = Self {
-            op,
+            op: enums::DhcpOperation::BootReply,
             htype: src.htype,
             hlen: src.hlen,
-            hops: src.hops,
+            hops: 0,
             xid: src.xid,
-            secs: src.secs,
+            secs: 0,
             flags: src.flags,
             ciaddr: src.ciaddr,
             yiaddr: src.yiaddr,
@@ -115,9 +109,9 @@ impl DhcpPacket {
             op,
             htype: src.htype,
             hlen: src.hlen,
-            hops: src.hops,
+            hops: 0,
             xid: src.xid,
-            secs: src.secs,
+            secs: 0,
             flags: src.flags,
             ciaddr: Ipv4Addr::UNSPECIFIED,
             yiaddr: Ipv4Addr::UNSPECIFIED,
@@ -703,5 +697,35 @@ mod tests {
             response.get_option(DhcpOption::CLIENTID),
             Some(DhcpOption::ClientId(value)) if value == &[1, 0xaa, 0xbb]
         ));
+    }
+
+    #[test]
+    fn response_sets_secs_and_hops_zero() {
+        let request = DhcpPacket::from_network(&packet_with_header(&[
+            53, 1, 1, // DHCPDISCOVER
+            255,
+        ]))
+        .expect("request should decode");
+
+        let response = DhcpPacket::response(&request, crate::backends::Lease::default());
+
+        assert_eq!(u8::from(response.op), 2); // BOOTREPLY
+        assert_eq!(response.hops, 0);
+        assert_eq!(response.secs, 0);
+    }
+
+    #[test]
+    fn nak_sets_secs_and_hops_zero() {
+        let request = DhcpPacket::from_network(&packet_with_header(&[
+            53, 1, 3, // DHCPREQUEST
+            255,
+        ]))
+        .expect("request should decode");
+
+        let response = DhcpPacket::nak(&request);
+
+        assert_eq!(u8::from(response.op), 2); // BOOTREPLY
+        assert_eq!(response.hops, 0);
+        assert_eq!(response.secs, 0);
     }
 }
