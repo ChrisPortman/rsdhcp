@@ -38,12 +38,6 @@ impl DhcpPacket {
     /// Given a DhcpPacket and a lease, generate the appropriate response packet
     /// according to DHCP specified symantics.
     pub fn response(src: &DhcpPacket, lease: Lease) -> Self {
-        let op = match src.op {
-            enums::DhcpOperation::BootRequest => enums::DhcpOperation::BootReply,
-            enums::DhcpOperation::BootReply => enums::DhcpOperation::BootRequest,
-            enums::DhcpOperation::Unknown(i) => enums::DhcpOperation::Unknown(i),
-        };
-
         let mut msg_type = enums::MessageType::Unknown(255);
         if let Some(DhcpOption::DhcpMsgType(mt)) = src.get_option(DhcpOption::DHCPMSGTYPE) {
             match mt {
@@ -55,12 +49,12 @@ impl DhcpPacket {
         }
 
         let mut new = Self {
-            op,
+            op: enums::DhcpOperation::BootReply,
             htype: src.htype,
             hlen: src.hlen,
-            hops: src.hops,
+            hops: 0,
             xid: src.xid,
-            secs: src.secs,
+            secs: 0,
             flags: src.flags,
             ciaddr: src.ciaddr,
             yiaddr: src.yiaddr,
@@ -115,9 +109,9 @@ impl DhcpPacket {
             op,
             htype: src.htype,
             hlen: src.hlen,
-            hops: src.hops,
+            hops: 0,
             xid: src.xid,
-            secs: src.secs,
+            secs: 0,
             flags: src.flags,
             ciaddr: Ipv4Addr::UNSPECIFIED,
             yiaddr: Ipv4Addr::UNSPECIFIED,
