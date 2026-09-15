@@ -95,10 +95,12 @@ struct NetboxDhcpLease {
 
 impl NetboxDhcpLease {
     async fn acknowledge(&mut self, client: &Client) -> Result<(), BackendError> {
-        self.acknowledged = false;
-
-        self.save(client).await?;
         self.acknowledged = true;
+
+        if let Err(e) = self.save(client).await {
+            self.acknowledged = false;
+            return Err(e);
+        }
 
         Ok(())
     }
