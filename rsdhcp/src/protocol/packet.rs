@@ -698,4 +698,34 @@ mod tests {
             Some(DhcpOption::ClientId(value)) if value == &[1, 0xaa, 0xbb]
         ));
     }
+
+    #[test]
+    fn response_sets_secs_and_hops_zero() {
+        let request = DhcpPacket::from_network(&packet_with_header(&[
+            53, 1, 1, // DHCPDISCOVER
+            255,
+        ]))
+        .expect("request should decode");
+
+        let response = DhcpPacket::response(&request, crate::backends::Lease::default());
+
+        assert_eq!(u8::from(response.op), 2); // BOOTREPLY
+        assert_eq!(response.hops, 0);
+        assert_eq!(response.secs, 0);
+    }
+
+    #[test]
+    fn nak_sets_secs_and_hops_zero() {
+        let request = DhcpPacket::from_network(&packet_with_header(&[
+            53, 1, 3, // DHCPREQUEST
+            255,
+        ]))
+        .expect("request should decode");
+
+        let response = DhcpPacket::nak(&request);
+
+        assert_eq!(u8::from(response.op), 2); // BOOTREPLY
+        assert_eq!(response.hops, 0);
+        assert_eq!(response.secs, 0);
+    }
 }
