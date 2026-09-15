@@ -173,19 +173,13 @@ impl DhcpStore for Memory {
 
     async fn handle_request_selecting(
         &self,
-        recv_ip: &Ipv4Addr,
+        _: &Ipv4Addr,
         packet: &packet::DhcpPacket,
     ) -> Result<Lease, BackendError> {
         // selecting is the client state that comes after a discover packet.
         // the "Requested IP address" option is used to carry the IP address contained in the
         // offer.
         info!("Handling request/selecting message");
-        if *recv_ip != packet.siaddr {
-            return Err(BackendError::BackendError(
-                "server ID does is not this server".to_string(),
-            ));
-        }
-
         let mut requested_ip_found = false;
         let mut requested_ip = Ipv4Addr::new(0, 0, 0, 0);
 

@@ -48,7 +48,7 @@ impl From<&packet::DhcpPacket> for NetboxDhcpLeaseRequest {
         };
 
         NetboxDhcpLeaseRequest {
-            mac_address: u8_to_hex(&item.chaddr[0..6].to_vec()),
+            mac_address: u8_to_hex(&item.chaddr[0..6]),
             client_id: u8_to_hex(&client_id),
             receiving_ip,
             requested_ip,
@@ -226,14 +226,14 @@ impl Netbox {
         }
     }
 
-    async fn get_leases_for_mac(
+    async fn get_leases_for_client_id(
         &self,
-        mac_address: String,
+        client_id: &str,
     ) -> Result<Vec<NetboxDhcpLease>, BackendError> {
         let response = send_request(
             self.client
                 .get(&self.lease_url)
-                .query(&[("mac_address", mac_address)]),
+                .query(&[("client_id", client_id)]),
         )
         .await?;
         let leases = match response
@@ -252,9 +252,8 @@ impl Netbox {
         recv_ip: &Ipv4Addr,
         packet: &packet::DhcpPacket,
     ) -> Result<NetboxDhcpLease, BackendError> {
-        let mac_address = u8_to_hex(&packet.chaddr[0..6].to_vec());
-
-        let existing_leases = self.get_leases_for_mac(mac_address).await?;
+        let client_id = Self::get_client_id(packet);
+        let existing_leases = self.get_leases_for_client_id(&client_id).await?;
         for mut l in existing_leases {
             if l.ip_address.address.contains(recv_ip) {
                 l.update_from_packet(packet);
@@ -314,11 +313,12 @@ impl Netbox {
         } else {
             *recv_ip
         };
-        let mac_address = u8_to_hex(&packet.chaddr[0..6].to_vec());
+
+        let client_id = Self::get_client_id(packet);
         let mut selected_lease: Option<NetboxDhcpLease> = None;
 
         // Find an existing lease for the MAC address on the correct subnet
-        let existing_leases = self.get_leases_for_mac(mac_address).await?;
+        let existing_leases = self.get_leases_for_client_id(&client_id).await?;
         for lease in existing_leases {
             if lease.ip_address.address.contains(&compare_ip) {
                 selected_lease = Some(lease);
@@ -349,9 +349,8 @@ impl Netbox {
     }
 
     async fn delete_lease(&self, packet: &packet::DhcpPacket) -> Result<(), BackendError> {
-        let mac_address = u8_to_hex(&packet.chaddr[0..6].to_vec());
-
-        let existing_leases = self.get_leases_for_mac(mac_address).await?;
+        let client_id = Self::get_client_id(packet);
+        let existing_leases = self.get_leases_for_client_id(&client_id).await?;
         for mut l in existing_leases {
             if l.ip_address.address.addr() == packet.ciaddr {
                 l.delete(&self.client).await?;
@@ -359,6 +358,14 @@ impl Netbox {
         }
 
         Ok(())
+    }
+
+    fn get_client_id(packet: &packet::DhcpPacket) -> String {
+        if let Some(DhcpOption::ClientId(cid)) = packet.get_option(DhcpOption::CLIENTID) {
+            u8_to_hex(cid)
+        } else {
+            u8_to_hex(&packet.chaddr[0..6])
+        }
     }
 }
 
@@ -427,7 +434,7 @@ impl DhcpStore for Netbox {
     }
 }
 
-fn u8_to_hex(bytes: &Vec<u8>) -> String {
+fn u8_to_hex(bytes: &[u8]) -> String {
     let mut mac_octets: Vec<String> = vec![];
     for b in bytes {
         mac_octets.push(format!("{:02X?}", b));

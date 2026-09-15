@@ -223,11 +223,11 @@ impl DhcpPacket {
             return Some(enums::ClientState::Selecting);
         }
 
-        if !self.is_broadcast() {
+        if !self.is_broadcast() && !self.ciaddr.is_unspecified() {
             return Some(enums::ClientState::Renewing);
         }
 
-        if self.ciaddr != Ipv4Addr::new(0, 0, 0, 0) {
+        if self.is_broadcast() && !self.ciaddr.is_unspecified() && self.siaddr.is_unspecified() {
             return Some(enums::ClientState::Rebinding);
         }
 
@@ -372,11 +372,12 @@ impl Display for DhcpOptions {
 
 #[cfg(test)]
 mod tests {
+    use std::net::Ipv4Addr;
     use std::panic::catch_unwind;
 
     use crate::protocol::enums::MessageType;
     use crate::protocol::option::DhcpOption;
-    use crate::protocol::packet;
+    use crate::protocol::packet::{self, DhcpPacket};
     use std::fs;
 
     #[test]
@@ -457,5 +458,204 @@ mod tests {
             result.unwrap(),
             Ok(DhcpOption::DhcpMsgType(MessageType::Discover))
         ));
+    }
+
+    fn packet_with_header(options: &[u8]) -> Vec<u8> {
+        let mut raw = vec![0u8; 236];
+
+        raw[0] = 2; // BOOTREPLY
+        raw[1] = 1; // Ethernet
+        raw[2] = 6; // MAC address length
+        raw[3] = 7; // hops
+
+        raw[4..8].copy_from_slice(&0x1234_5678u32.to_be_bytes());
+        raw[8..10].copy_from_slice(&17u16.to_be_bytes());
+        raw[10..12].copy_from_slice(&0x8000u16.to_be_bytes());
+
+        raw[12..16].copy_from_slice(&Ipv4Addr::new(10, 0, 0, 1).octets());
+        raw[16..20].copy_from_slice(&Ipv4Addr::new(10, 0, 0, 42).octets());
+        raw[20..24].copy_from_slice(&Ipv4Addr::new(10, 0, 0, 2).octets());
+        raw[24..28].copy_from_slice(&Ipv4Addr::new(10, 0, 0, 254).octets());
+
+        raw[28..44].copy_from_slice(&[
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ]);
+
+        raw[44..52].copy_from_slice(b"server01");
+        raw[108..118].copy_from_slice(b"pxelinux.0");
+
+        raw.extend_from_slice(&[99, 130, 83, 99]);
+        raw.extend_from_slice(options);
+        raw
+    }
+
+    fn option_codes(packet: &DhcpPacket) -> Vec<u8> {
+        packet
+            .options
+            .options
+            .iter()
+            .map(DhcpOption::code)
+            .collect()
+    }
+
+    #[test]
+    fn decodes_complete_packet_with_mixed_option_ranges() {
+        let options = [
+            0, // PAD
+            53, 1, 2, // DHCP message type: OFFER
+            3, 8, 10, 0, 0, 1, 10, 0, 0, 254, // Router
+            51, 4, 0, 0, 14, 16, // Lease time: 3600
+            61, 3, 1, 0xaa, 0xbb, // Client identifier
+            0,    // PAD
+            255,  // END
+            0, 0, 0, // trailing padding
+        ];
+
+        let packet = DhcpPacket::from_network(&packet_with_header(&options))
+            .expect("complete DHCP packet should decode");
+
+        assert_eq!(u8::from(packet.op), 2);
+        assert_eq!(u8::from(packet.htype), 1);
+        assert_eq!(packet.hlen, 6);
+        assert_eq!(packet.hops, 7);
+        assert_eq!(packet.xid, 0x1234_5678);
+        assert_eq!(packet.secs, 17);
+        assert_eq!(packet.flags, 0x8000);
+
+        assert_eq!(packet.ciaddr, Ipv4Addr::new(10, 0, 0, 1));
+        assert_eq!(packet.yiaddr, Ipv4Addr::new(10, 0, 0, 42));
+        assert_eq!(packet.siaddr, Ipv4Addr::new(10, 0, 0, 2));
+        assert_eq!(packet.giaddr, Ipv4Addr::new(10, 0, 0, 254));
+        assert_eq!(&packet.chaddr[..6], &[0, 0x11, 0x22, 0x33, 0x44, 0x55]);
+        assert_eq!(&packet.sname[..8], b"server01");
+        assert_eq!(&packet.file[..10], b"pxelinux.0");
+        assert_eq!(packet.cookie, [99, 130, 83, 99]);
+
+        assert_eq!(option_codes(&packet), vec![53, 3, 51, 61]);
+        assert!(matches!(packet.message_type(), Some(MessageType::Offer)));
+
+        assert!(matches!(
+            packet.get_option(DhcpOption::ROUTER),
+            Some(DhcpOption::Router(routers)) if routers.len() == 2
+        ));
+
+        assert!(matches!(
+            packet.get_option(DhcpOption::CLIENTID),
+            Some(DhcpOption::ClientId(value)) if value == &[1, 0xaa, 0xbb]
+        ));
+    }
+
+    #[test]
+    fn accepts_exact_fixed_header_with_valid_cookie_and_no_options() {
+        let packet = DhcpPacket::from_network(&packet_with_header(&[]))
+            .expect("240-byte packet with valid cookie should decode");
+
+        assert!(packet.options.options.is_empty());
+        assert_eq!(packet.cookie, [99, 130, 83, 99]);
+    }
+
+    #[test]
+    fn rejects_invalid_cookie_before_option_processing() {
+        let mut raw = packet_with_header(&[53, 1, 1, 255]);
+        raw[236..240].copy_from_slice(&[0, 0, 0, 0]);
+
+        let result = catch_unwind(|| DhcpPacket::from_network(&raw));
+
+        assert!(result.is_ok(), "invalid cookie caused a panic");
+        assert!(result.unwrap().is_err());
+    }
+
+    #[test]
+    fn rejects_all_packets_shorter_than_the_fixed_header() {
+        for length in [0usize, 1, 28, 239] {
+            let raw = vec![0u8; length];
+            let result = catch_unwind(|| DhcpPacket::from_network(&raw));
+
+            assert!(result.is_ok(), "length {length} caused a panic");
+            assert!(result.unwrap().is_err(), "length {length} was accepted");
+        }
+    }
+
+    #[test]
+    fn rejects_truncated_option_headers_and_payloads() {
+        let malformed_options: &[&[u8]] = &[
+            &[53],                  // missing length
+            &[53, 1],               // missing payload
+            &[53, 2, 1],            // short payload
+            &[1, 4, 255, 255, 255], // truncated IPv4 option
+        ];
+
+        for options in malformed_options {
+            let raw = packet_with_header(options);
+            let result = catch_unwind(|| DhcpPacket::from_network(&raw));
+
+            assert!(result.is_ok(), "malformed option caused a panic");
+            assert!(result.unwrap().is_err());
+        }
+    }
+
+    #[test]
+    fn ignores_unknown_option_and_decodes_following_known_option() {
+        let options = [
+            200, 3, 1, 2, 3, // Unknown option
+            53, 1, 1, // DHCP message type: DISCOVER
+            255,
+        ];
+
+        let packet = DhcpPacket::from_network(&packet_with_header(&options))
+            .expect("unknown options should not desynchronize parsing");
+
+        assert_eq!(option_codes(&packet), vec![53]);
+        assert!(matches!(packet.message_type(), Some(MessageType::Discover)));
+    }
+
+    #[test]
+    fn skips_invalid_known_option_without_losing_cursor_alignment() {
+        let options = [
+            1, 3, 192, 0, 2, // Invalid subnet-mask length
+            53, 1, 1, // Valid DHCP message type
+            255,
+        ];
+
+        let packet = DhcpPacket::from_network(&packet_with_header(&options))
+            .expect("invalid option should not corrupt following options");
+
+        assert_eq!(option_codes(&packet), vec![53]);
+        assert!(matches!(packet.message_type(), Some(MessageType::Discover)));
+    }
+
+    #[test]
+    fn stops_processing_at_end_option() {
+        let options = [
+            53, 1, 1,   // Valid option
+            255, // END
+            53, 1, 2, // Must not be processed
+            1, 4, 255, 255, 255, 0,
+        ];
+
+        let packet = DhcpPacket::from_network(&packet_with_header(&options))
+            .expect("options after END should not be processed");
+
+        assert_eq!(option_codes(&packet), vec![53]);
+        assert!(matches!(packet.message_type(), Some(MessageType::Discover)));
+    }
+
+    #[test]
+    fn decodes_packet_after_network_round_trip() {
+        let options = [0, 53, 1, 2, 3, 4, 10, 0, 0, 1, 54, 4, 10, 0, 0, 2, 255];
+
+        let original = DhcpPacket::from_network(&packet_with_header(&options))
+            .expect("initial packet should decode");
+
+        let encoded = original.to_network();
+        let decoded =
+            DhcpPacket::from_network(&encoded).expect("serialized packet should decode again");
+
+        assert_eq!(decoded.xid, original.xid);
+        assert_eq!(decoded.ciaddr, original.ciaddr);
+        assert_eq!(decoded.yiaddr, original.yiaddr);
+        assert_eq!(decoded.giaddr, original.giaddr);
+        assert_eq!(decoded.cookie, [99, 130, 83, 99]);
+        assert_eq!(option_codes(&decoded), vec![53, 3, 54]);
     }
 }
