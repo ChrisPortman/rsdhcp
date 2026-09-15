@@ -38,10 +38,7 @@ impl From<&packet::DhcpPacket> for NetboxDhcpLeaseRequest {
     fn from(item: &packet::DhcpPacket) -> Self {
         let receiving_ip = item.giaddr;
 
-        let client_id: &Vec<u8> = match item.get_option(DhcpOption::CLIENTID) {
-            Some(DhcpOption::ClientId(o)) => o,
-            _ => &item.chaddr[0..6].to_vec(),
-        };
+        let client_id = get_client_id(item);
 
         let requested_ip = match item.get_option(DhcpOption::ADDRESSREQUEST) {
             Some(DhcpOption::AddressRequest(o)) => Some(*o),
@@ -57,7 +54,7 @@ impl From<&packet::DhcpPacket> for NetboxDhcpLeaseRequest {
 
         NetboxDhcpLeaseRequest {
             mac_address: u8_to_hex(&item.chaddr[0..hlen]),
-            client_id: u8_to_hex(client_id),
+            client_id,
             receiving_ip,
             requested_ip,
             hostname,
@@ -271,7 +268,7 @@ impl Netbox {
         recv_ip: &Ipv4Addr,
         packet: &packet::DhcpPacket,
     ) -> Result<NetboxDhcpLease, BackendError> {
-        let client_id = Self::get_client_id(packet);
+        let client_id = get_client_id(packet);
         let existing_leases = self.get_leases_for_client_id(&client_id).await?;
         for mut l in existing_leases {
             if l.ip_address.address.contains(recv_ip) {
@@ -333,7 +330,7 @@ impl Netbox {
             *recv_ip
         };
 
-        let client_id = Self::get_client_id(packet);
+        let client_id = get_client_id(packet);
         let mut selected_lease: Option<NetboxDhcpLease> = None;
 
         // Find an existing lease for the MAC address on the correct subnet
@@ -368,7 +365,7 @@ impl Netbox {
     }
 
     async fn delete_lease(&self, packet: &packet::DhcpPacket) -> Result<(), BackendError> {
-        let client_id = Self::get_client_id(packet);
+        let client_id = get_client_id(packet);
         let existing_leases = self.get_leases_for_client_id(&client_id).await?;
         for mut l in existing_leases {
             if l.ip_address.address.addr() == packet.ciaddr {
@@ -380,7 +377,7 @@ impl Netbox {
     }
 
     async fn decline_lease(&self, packet: &packet::DhcpPacket) -> Result<(), BackendError> {
-        let client_id = Self::get_client_id(packet);
+        let client_id = get_client_id(packet);
         let existing_leases = self.get_leases_for_client_id(&client_id).await?;
 
         let declined_addr = match packet.get_option(DhcpOption::ADDRESSREQUEST) {
@@ -395,16 +392,6 @@ impl Netbox {
         }
 
         Ok(())
-    }
-
-    fn get_client_id(packet: &packet::DhcpPacket) -> String {
-        match packet.get_option(DhcpOption::CLIENTID) {
-            Some(DhcpOption::ClientId(cid)) => u8_to_hex(cid),
-            _ => {
-                let len = cmp::min(usize::from(packet.hlen), packet.chaddr.len());
-                u8_to_hex(&packet.chaddr[0..len])
-            }
-        }
     }
 }
 
@@ -502,5 +489,55 @@ async fn send_request(request: RequestBuilder) -> Result<reqwest::Response, Back
             )))
         }
         Err(e) => Err(BackendError::BackendError(e.to_string())),
+    }
+}
+
+fn get_client_id(packet: &packet::DhcpPacket) -> String {
+    match packet.get_option(DhcpOption::CLIENTID) {
+        Some(DhcpOption::ClientId(cid)) => u8_to_hex(cid),
+        _ => {
+            let len = cmp::min(usize::from(packet.hlen), packet.chaddr.len());
+            u8_to_hex(&packet.chaddr[0..len])
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::packet::DhcpPacket;
+
+    fn packet_with_hlen(hlen: u8) -> DhcpPacket {
+        let mut raw = vec![0u8; 236];
+        raw[0] = 1; // BOOTREQUEST
+        raw[1] = 1; // Ethernet hardware type
+        raw[2] = hlen;
+        raw[28..44].copy_from_slice(&[
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ]);
+        raw.extend_from_slice(&[99, 130, 83, 99]);
+        raw.extend_from_slice(&[53, 1, 1, 255]); // DHCPDISCOVER
+
+        DhcpPacket::from_network(&raw).expect("packet should decode")
+    }
+
+    #[test]
+    fn fallback_client_id_uses_hlen() {
+        let packet = packet_with_hlen(4);
+        let request = NetboxDhcpLeaseRequest::from(&packet);
+
+        assert_eq!(request.mac_address, "00:11:22:33");
+        assert_eq!(request.client_id, "00:11:22:33");
+        assert_eq!(get_client_id(&packet), "00:11:22:33");
+    }
+
+    #[test]
+    fn zero_hlen_does_not_create_a_six_byte_fallback_identity() {
+        let packet = packet_with_hlen(0);
+        let request = NetboxDhcpLeaseRequest::from(&packet);
+
+        assert_eq!(request.mac_address, "");
+        assert_eq!(request.client_id, "");
+        assert_eq!(get_client_id(&packet), "");
     }
 }

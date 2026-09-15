@@ -132,6 +132,11 @@ impl DhcpPacket {
 
         new.options.options.push(DhcpOption::DhcpMsgType(msg_type));
 
+        // Echo back options in the incomming packet as required by the RFC
+        if let Some(o) = src.get_option(DhcpOption::CLIENTID) {
+            new.options.options.push(o.clone());
+        }
+
         new
     }
 
@@ -662,5 +667,41 @@ mod tests {
         assert_eq!(decoded.giaddr, original.giaddr);
         assert_eq!(decoded.cookie, [99, 130, 83, 99]);
         assert_eq!(option_codes(&decoded), vec![53, 3, 54]);
+    }
+
+    #[test]
+    fn response_echoes_client_identifier() {
+        let options = [
+            53, 1, 1, // DHCPDISCOVER
+            61, 3, 1, 0xaa, 0xbb, // Client identifier
+            255,
+        ];
+        let request =
+            DhcpPacket::from_network(&packet_with_header(&options)).expect("request should decode");
+
+        let response = DhcpPacket::response(&request, crate::backends::Lease::default());
+
+        assert!(matches!(
+            response.get_option(DhcpOption::CLIENTID),
+            Some(DhcpOption::ClientId(value)) if value == &[1, 0xaa, 0xbb]
+        ));
+    }
+
+    #[test]
+    fn nak_echoes_client_identifier() {
+        let options = [
+            53, 1, 3, // DHCPREQUEST
+            61, 3, 1, 0xaa, 0xbb, // Client identifier
+            255,
+        ];
+        let request =
+            DhcpPacket::from_network(&packet_with_header(&options)).expect("request should decode");
+
+        let response = DhcpPacket::nak(&request);
+
+        assert!(matches!(
+            response.get_option(DhcpOption::CLIENTID),
+            Some(DhcpOption::ClientId(value)) if value == &[1, 0xaa, 0xbb]
+        ));
     }
 }
