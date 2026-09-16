@@ -523,7 +523,7 @@ mod tests {
         raw.extend_from_slice(&[99, 130, 83, 99]);
         raw.extend_from_slice(&[53, 1, 1, 255]); // DHCPDISCOVER
 
-        DhcpPacket::from_network(&raw).expect("packet should decode")
+        DhcpPacket::from_network(&raw, false).expect("packet should decode")
     }
 
     #[test]

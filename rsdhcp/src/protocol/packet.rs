@@ -37,6 +37,7 @@ pub struct DhcpPacket {
     pub options: DhcpOptions,
 
     max_client_message_size: Option<u16>,
+    received_by_broadcast: bool,
 }
 
 impl DhcpPacket {
@@ -71,6 +72,7 @@ impl DhcpPacket {
             cookie: COOKIE,
             options: DhcpOptions::new(None),
             max_client_message_size: None,
+            received_by_broadcast: self.received_by_broadcast,
         };
 
         if let Some(DhcpOption::DhcpMaxMsgSize(s)) = self.get_option(DhcpOption::DHCPMAXMSGSIZE) {
@@ -122,34 +124,35 @@ impl DhcpPacket {
 
     /// Given a DhcpPacket generate the appropriate Negative Acknowledgment accoding
     /// to DHCP specified symantics.
-    pub fn nak(src: &DhcpPacket) -> Self {
+    pub fn nak(&self) -> Self {
         let op = enums::DhcpOperation::BootReply;
         let msg_type = enums::MessageType::NegAcknowledge;
 
         let mut new = Self {
             op,
-            htype: src.htype,
-            hlen: src.hlen,
+            htype: self.htype,
+            hlen: self.hlen,
             hops: 0,
-            xid: src.xid,
+            xid: self.xid,
             secs: 0,
-            flags: src.flags,
+            flags: self.flags,
             ciaddr: Ipv4Addr::UNSPECIFIED,
             yiaddr: Ipv4Addr::UNSPECIFIED,
             siaddr: Ipv4Addr::UNSPECIFIED,
-            giaddr: src.giaddr,
-            chaddr: src.chaddr,
+            giaddr: self.giaddr,
+            chaddr: self.chaddr,
             sname: [0u8; 64],
             file: [0u8; 128],
             cookie: COOKIE,
             options: DhcpOptions::new(None),
             max_client_message_size: None,
+            received_by_broadcast: self.received_by_broadcast,
         };
 
         new.options.options.push(DhcpOption::DhcpMsgType(msg_type));
 
         // Echo back options in the incomming packet as required by the RFC
-        if let Some(o) = src.get_option(DhcpOption::CLIENTID) {
+        if let Some(o) = self.get_option(DhcpOption::CLIENTID) {
             new.options.options.push(o.clone());
         }
 
@@ -158,7 +161,7 @@ impl DhcpPacket {
 
     /// Deserialze a DHCP packet from the provided byte slice.  E.g. bytes read
     /// from a UDP socket.
-    pub fn from_network(raw: &[u8]) -> Result<Self, PacketError> {
+    pub fn from_network(raw: &[u8], broadcast: bool) -> Result<Self, PacketError> {
         if raw.len() < 240 {
             return Err(PacketError::new("insufficient bytes in packet"));
         }
@@ -181,6 +184,7 @@ impl DhcpPacket {
             cookie: raw[236..240].try_into()?,
             options: DhcpOptions::new(None),
             max_client_message_size: None,
+            received_by_broadcast: broadcast,
         };
 
         if packet.cookie != COOKIE {
@@ -278,7 +282,7 @@ impl DhcpPacket {
                 return Some(enums::ClientState::Selecting);
             }
 
-            if !self.is_broadcast()
+            if !self.broadcast_by_client()
                 && !self.ciaddr.is_unspecified()
                 && self.giaddr.is_unspecified()
                 && self.get_option(DhcpOption::DHCPSERVERID).is_none()
@@ -287,7 +291,7 @@ impl DhcpPacket {
                 return Some(enums::ClientState::Renewing);
             }
 
-            if self.is_broadcast()
+            if self.broadcast_by_client()
                 && !self.ciaddr.is_unspecified()
                 && self.get_option(DhcpOption::DHCPSERVERID).is_none()
                 && self.get_option(DhcpOption::ADDRESSREQUEST).is_none()
@@ -307,7 +311,7 @@ impl DhcpPacket {
     }
 
     /// Return true if the broadcast flag in the DhcpPacket is set.
-    pub fn is_broadcast(&self) -> bool {
+    pub fn return_broadcast(&self) -> bool {
         if self.flags >> 15 == 1 {
             return true;
         }
@@ -322,6 +326,18 @@ impl DhcpPacket {
     /// Add the provided option to the DhcpPacket packet.
     pub fn add_option(&mut self, option: DhcpOption) {
         self.options.options.push(option);
+    }
+
+    /// Retuns true if the client sent its request by broadcast.  We know that it did
+    /// if we either received the packet via a dhcp gateway (giaddr is set) or if the
+    /// server received it directly by local broadcast.
+    pub fn broadcast_by_client(&self) -> bool {
+        if !self.giaddr.is_unspecified() {
+            // indicates that the client broadcast and was handled by the local dhcp gateway
+            return true;
+        }
+
+        self.received_by_broadcast
     }
 }
 
@@ -522,7 +538,7 @@ mod tests {
         let sample_data =
             fs::read("test_data/discover.dhcp.bin").expect("failed to read data file");
         let dhcp_packet =
-            packet::DhcpPacket::from_network(&sample_data).expect("Failed to decode packet");
+            packet::DhcpPacket::from_network(&sample_data, true).expect("Failed to decode packet");
         assert_eq!(u8::from(dhcp_packet.message_type().unwrap()), 1u8);
         let network_data = dhcp_packet.to_network();
         assert_eq!(sample_data, network_data);
@@ -533,11 +549,11 @@ mod tests {
         let sample_data =
             fs::read("test_data/discover.dhcp.bin").expect("failed to read data file");
         let mut dhcp_packet =
-            packet::DhcpPacket::from_network(&sample_data).expect("Failed to decode packet");
+            packet::DhcpPacket::from_network(&sample_data, false).expect("Failed to decode packet");
         println!("flags: {:#?}", dhcp_packet.flags);
-        assert!(!dhcp_packet.is_broadcast());
+        assert!(!dhcp_packet.return_broadcast());
         dhcp_packet.flags = 32768u16;
-        assert!(dhcp_packet.is_broadcast());
+        assert!(dhcp_packet.return_broadcast());
     }
 
     #[test]
@@ -545,7 +561,7 @@ mod tests {
         let sample_data =
             fs::read("test_data/discover.dhcp.bin").expect("failed to read data file");
         let dhcp_packet =
-            packet::DhcpPacket::from_network(&sample_data).expect("Failed to decode packet");
+            packet::DhcpPacket::from_network(&sample_data, false).expect("Failed to decode packet");
         let opt = dhcp_packet.get_option(DhcpOption::DHCPMSGTYPE);
         if let Some(DhcpOption::DhcpMsgType(opt)) = opt {
             println!("Option data: {:#?}", opt);
@@ -561,7 +577,7 @@ mod tests {
 
     #[test]
     fn rejects_short_fixed_header_without_panicking() {
-        let result = catch_unwind(|| packet::DhcpPacket::from_network(&[0u8; 239]));
+        let result = catch_unwind(|| packet::DhcpPacket::from_network(&[0u8; 239], false));
 
         assert!(result.is_ok(), "short packet caused a panic");
         assert!(result.unwrap().is_err());
@@ -570,7 +586,7 @@ mod tests {
     #[test]
     fn rejects_empty_options_without_panicking() {
         let raw = packet_with_options(&[]);
-        let result = catch_unwind(|| packet::DhcpPacket::from_network(&raw));
+        let result = catch_unwind(|| packet::DhcpPacket::from_network(&raw, false));
 
         assert!(result.is_ok(), "empty option area caused a panic");
         assert!(result.unwrap().unwrap().options.options.is_empty());
@@ -580,7 +596,7 @@ mod tests {
     fn rejects_truncated_option_payload_without_panicking() {
         // Option 1 claims two payload bytes but only one is present.
         let raw = packet_with_options(&[1, 2, 0]);
-        let result = catch_unwind(|| packet::DhcpPacket::from_network(&raw));
+        let result = catch_unwind(|| packet::DhcpPacket::from_network(&raw, false));
 
         assert!(result.is_ok(), "truncated option caused a panic");
         assert!(result.unwrap().is_err());
@@ -648,7 +664,7 @@ mod tests {
             0, 0, 0, // trailing padding
         ];
 
-        let packet = DhcpPacket::from_network(&packet_with_header(&options))
+        let packet = DhcpPacket::from_network(&packet_with_header(&options), false)
             .expect("complete DHCP packet should decode");
 
         assert_eq!(u8::from(packet.op), 2);
@@ -684,7 +700,7 @@ mod tests {
 
     #[test]
     fn accepts_exact_fixed_header_with_valid_cookie_and_no_options() {
-        let packet = DhcpPacket::from_network(&packet_with_header(&[]))
+        let packet = DhcpPacket::from_network(&packet_with_header(&[]), false)
             .expect("240-byte packet with valid cookie should decode");
 
         assert!(packet.options.options.is_empty());
@@ -696,7 +712,7 @@ mod tests {
         let mut raw = packet_with_header(&[53, 1, 1, 255]);
         raw[236..240].copy_from_slice(&[0, 0, 0, 0]);
 
-        let result = catch_unwind(|| DhcpPacket::from_network(&raw));
+        let result = catch_unwind(|| DhcpPacket::from_network(&raw, false));
 
         assert!(result.is_ok(), "invalid cookie caused a panic");
         assert!(result.unwrap().is_err());
@@ -706,7 +722,7 @@ mod tests {
     fn rejects_all_packets_shorter_than_the_fixed_header() {
         for length in [0usize, 1, 28, 239] {
             let raw = vec![0u8; length];
-            let result = catch_unwind(|| DhcpPacket::from_network(&raw));
+            let result = catch_unwind(|| DhcpPacket::from_network(&raw, false));
 
             assert!(result.is_ok(), "length {length} caused a panic");
             assert!(result.unwrap().is_err(), "length {length} was accepted");
@@ -724,7 +740,7 @@ mod tests {
 
         for options in malformed_options {
             let raw = packet_with_header(options);
-            let result = catch_unwind(|| DhcpPacket::from_network(&raw));
+            let result = catch_unwind(|| DhcpPacket::from_network(&raw, false));
 
             assert!(result.is_ok(), "malformed option caused a panic");
             assert!(result.unwrap().is_err());
@@ -739,7 +755,7 @@ mod tests {
             255,
         ];
 
-        let packet = DhcpPacket::from_network(&packet_with_header(&options))
+        let packet = DhcpPacket::from_network(&packet_with_header(&options), false)
             .expect("unknown options should not desynchronize parsing");
 
         assert_eq!(option_codes(&packet), vec![53]);
@@ -754,7 +770,7 @@ mod tests {
             255,
         ];
 
-        let packet = DhcpPacket::from_network(&packet_with_header(&options))
+        let packet = DhcpPacket::from_network(&packet_with_header(&options), false)
             .expect("invalid option should not corrupt following options");
 
         assert_eq!(option_codes(&packet), vec![53]);
@@ -770,7 +786,7 @@ mod tests {
             1, 4, 255, 255, 255, 0,
         ];
 
-        let packet = DhcpPacket::from_network(&packet_with_header(&options))
+        let packet = DhcpPacket::from_network(&packet_with_header(&options), false)
             .expect("options after END should not be processed");
 
         assert_eq!(option_codes(&packet), vec![53]);
@@ -781,12 +797,12 @@ mod tests {
     fn decodes_packet_after_network_round_trip() {
         let options = [0, 53, 1, 2, 3, 4, 10, 0, 0, 1, 54, 4, 10, 0, 0, 2, 255];
 
-        let original = DhcpPacket::from_network(&packet_with_header(&options))
+        let original = DhcpPacket::from_network(&packet_with_header(&options), false)
             .expect("initial packet should decode");
 
         let encoded = original.to_network();
-        let decoded =
-            DhcpPacket::from_network(&encoded).expect("serialized packet should decode again");
+        let decoded = DhcpPacket::from_network(&encoded, false)
+            .expect("serialized packet should decode again");
 
         assert_eq!(decoded.xid, original.xid);
         assert_eq!(decoded.ciaddr, original.ciaddr);
@@ -803,8 +819,8 @@ mod tests {
             61, 3, 1, 0xaa, 0xbb, // Client identifier
             255,
         ];
-        let request =
-            DhcpPacket::from_network(&packet_with_header(&options)).expect("request should decode");
+        let request = DhcpPacket::from_network(&packet_with_header(&options), false)
+            .expect("request should decode");
 
         let response = DhcpPacket::response(&request, crate::backends::Lease::default());
 
@@ -821,8 +837,8 @@ mod tests {
             61, 3, 1, 0xaa, 0xbb, // Client identifier
             255,
         ];
-        let request =
-            DhcpPacket::from_network(&packet_with_header(&options)).expect("request should decode");
+        let request = DhcpPacket::from_network(&packet_with_header(&options), false)
+            .expect("request should decode");
 
         let response = DhcpPacket::nak(&request);
 
@@ -834,10 +850,13 @@ mod tests {
 
     #[test]
     fn response_sets_secs_and_hops_zero() {
-        let request = DhcpPacket::from_network(&packet_with_header(&[
-            53, 1, 1, // DHCPDISCOVER
-            255,
-        ]))
+        let request = DhcpPacket::from_network(
+            &packet_with_header(&[
+                53, 1, 1, // DHCPDISCOVER
+                255,
+            ]),
+            false,
+        )
         .expect("request should decode");
 
         let response = DhcpPacket::response(&request, crate::backends::Lease::default());
@@ -849,10 +868,13 @@ mod tests {
 
     #[test]
     fn nak_sets_secs_and_hops_zero() {
-        let request = DhcpPacket::from_network(&packet_with_header(&[
-            53, 1, 3, // DHCPREQUEST
-            255,
-        ]))
+        let request = DhcpPacket::from_network(
+            &packet_with_header(&[
+                53, 1, 3, // DHCPREQUEST
+                255,
+            ]),
+            false,
+        )
         .expect("request should decode");
 
         let response = DhcpPacket::nak(&request);
@@ -874,7 +896,7 @@ mod tests {
             255,
         ];
 
-        let request = DhcpPacket::from_network(&packet_with_header(&request_options))
+        let request = DhcpPacket::from_network(&packet_with_header(&request_options), false)
             .expect("request should decode");
 
         let mut lease = crate::backends::Lease::default();
@@ -961,7 +983,7 @@ mod tests {
             255,
         ];
 
-        let request = DhcpPacket::from_network(&packet_with_header(&request_options))
+        let request = DhcpPacket::from_network(&packet_with_header(&request_options), false)
             .expect("request should decode");
 
         let mut lease = crate::backends::Lease::default();
