@@ -118,14 +118,13 @@ impl<T: DhcpStore + Sync + Send + 'static> IPServer<T> {
         };
 
         let socket_arc = Arc::new(socket);
-        let mut buf = [0u8; 1500];
-        let mut len: usize;
         let mut src: std::net::SocketAddr;
 
         loop {
             info!("waiting for packet on {}", self.ip);
-            match socket_arc.recv_from(&mut buf).await {
-                Ok(r) => (len, src) = r,
+            let mut buf = Vec::with_capacity(1500);
+            match socket_arc.recv_buf_from(&mut buf).await {
+                Ok(r) => (_, src) = r,
                 Err(e) => {
                     error!("Reading from network failed: {}", e);
                     continue;
@@ -138,9 +137,7 @@ impl<T: DhcpStore + Sync + Send + 'static> IPServer<T> {
             let store = self.store.clone();
 
             // Launch a task to process the data
-            tokio::spawn(
-                async move { process_packet_data(ip, sock, buf[..len].to_vec(), store).await },
-            );
+            tokio::spawn(async move { process_packet_data(ip, sock, buf, store).await });
         }
     }
 }
@@ -227,10 +224,11 @@ async fn process_packet_data<T: DhcpStore>(
             )),
         };
 
-        let mut response: packet::DhcpPacket = match lease_result {
-            Ok(lease) => {
+        let response: packet::DhcpPacket = match lease_result {
+            Ok(mut lease) => {
                 info!("resolved lease: {:?}", lease);
-                packet::DhcpPacket::response(&packet, lease)
+                lease.server_identifier = server_ip;
+                packet.response(lease)
             }
             Err(e) => match e {
                 BackendError::LeaseMismatchClientIP() => {
@@ -247,8 +245,6 @@ async fn process_packet_data<T: DhcpStore>(
                 }
             },
         };
-
-        response.add_option(option::DhcpOption::DhcpServerId(server_ip));
 
         let mut dst_ip = Ipv4Addr::new(255, 255, 255, 255);
         let mut dst_p = enums::DHCP_CLIENT_PORT;

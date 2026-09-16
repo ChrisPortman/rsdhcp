@@ -1,7 +1,7 @@
-use std::fmt;
 use std::fmt::{Display, Formatter};
 use std::io::Cursor;
 use std::net::Ipv4Addr;
+use std::{cmp, fmt};
 
 use byteorder::ReadBytesExt;
 use log::warn;
@@ -12,6 +12,9 @@ use crate::protocol::errors::PacketError;
 use crate::protocol::option::DhcpOption;
 
 const COOKIE: [u8; 4] = [99, 130, 83, 99];
+const DHCP_HEADER_LEN: usize = 240;
+const MIN_MAX_MESSAGE_LEN: usize = 576;
+const DEFAULT_LEASE_TIME_SECS: u32 = 3600;
 
 /// Represents the structure of a DHCP message or packet.
 #[derive(Debug)]
@@ -32,14 +35,16 @@ pub struct DhcpPacket {
     pub file: [u8; 128],
     pub cookie: [u8; 4],
     pub options: DhcpOptions,
+
+    max_client_message_size: Option<u16>,
 }
 
 impl DhcpPacket {
     /// Given a DhcpPacket and a lease, generate the appropriate response packet
     /// according to DHCP specified symantics.
-    pub fn response(src: &DhcpPacket, lease: Lease) -> Self {
+    pub fn response(&self, lease: Lease) -> Self {
         let mut msg_type = enums::MessageType::Unknown(255);
-        if let Some(DhcpOption::DhcpMsgType(mt)) = src.get_option(DhcpOption::DHCPMSGTYPE) {
+        if let Some(DhcpOption::DhcpMsgType(mt)) = self.get_option(DhcpOption::DHCPMSGTYPE) {
             match mt {
                 enums::MessageType::Discover => msg_type = enums::MessageType::Offer,
                 enums::MessageType::Request => msg_type = enums::MessageType::Acknowledge,
@@ -50,50 +55,66 @@ impl DhcpPacket {
 
         let mut new = Self {
             op: enums::DhcpOperation::BootReply,
-            htype: src.htype,
-            hlen: src.hlen,
+            htype: self.htype,
+            hlen: self.hlen,
             hops: 0,
-            xid: src.xid,
+            xid: self.xid,
             secs: 0,
-            flags: src.flags,
-            ciaddr: src.ciaddr,
-            yiaddr: src.yiaddr,
-            siaddr: src.siaddr,
-            giaddr: src.giaddr,
-            chaddr: src.chaddr,
+            flags: self.flags,
+            ciaddr: self.ciaddr,
+            yiaddr: self.yiaddr,
+            siaddr: self.siaddr,
+            giaddr: self.giaddr,
+            chaddr: self.chaddr,
             sname: [0u8; 64],
             file: [0u8; 128],
             cookie: COOKIE,
             options: DhcpOptions::new(None),
+            max_client_message_size: None,
         };
 
-        if let Some(ip) = lease.yiaddr {
-            new.yiaddr = ip;
+        if let Some(DhcpOption::DhcpMaxMsgSize(s)) = self.get_option(DhcpOption::DHCPMAXMSGSIZE) {
+            new.max_client_message_size = Some(*s);
         }
+
+        new.options.options.push(DhcpOption::DhcpMsgType(msg_type));
+        new.options
+            .options
+            .push(DhcpOption::DhcpServerId(lease.server_identifier));
+
+        let mut lease_time = DEFAULT_LEASE_TIME_SECS;
+        if lease.lease_duration.num_seconds() > 0 {
+            lease_time = lease
+                .lease_duration
+                .num_seconds()
+                .try_into()
+                .unwrap_or(DEFAULT_LEASE_TIME_SECS);
+        }
+        new.options
+            .options
+            .push(DhcpOption::AddressTime(lease_time));
+
+        if let Some(ip) = lease.yiaddr {
+            new.yiaddr = ip.addr();
+            new.options
+                .options
+                .push(DhcpOption::SubnetMask(ip.netmask()));
+        }
+
         if let Some(ip) = lease.siaddr {
             new.siaddr = ip;
         }
         if let Some(f) = lease.file {
             new.file = f;
         }
-        if let Some(o) = lease.options {
-            new.options.options.extend(o.options);
-        }
-
-        if lease.lease_duration.num_seconds() > 0 {
-            let lease_val = lease
-                .lease_duration
-                .num_seconds()
-                .try_into()
-                .unwrap_or(u32::MAX);
-            new.options.options.push(DhcpOption::AddressTime(lease_val));
-        }
-
-        new.options.options.push(DhcpOption::DhcpMsgType(msg_type));
 
         // Echo back options in the incomming packet as required by the RFC
-        if let Some(o) = src.get_option(DhcpOption::CLIENTID) {
+        if let Some(o) = self.get_option(DhcpOption::CLIENTID) {
             new.options.options.push(o.clone());
+        }
+
+        if let Some(options) = lease.options {
+            new.options.options.extend(options.options);
         }
 
         new
@@ -122,6 +143,7 @@ impl DhcpPacket {
             file: [0u8; 128],
             cookie: COOKIE,
             options: DhcpOptions::new(None),
+            max_client_message_size: None,
         };
 
         new.options.options.push(DhcpOption::DhcpMsgType(msg_type));
@@ -158,6 +180,7 @@ impl DhcpPacket {
             file: raw[108..236].try_into()?,
             cookie: raw[236..240].try_into()?,
             options: DhcpOptions::new(None),
+            max_client_message_size: None,
         };
 
         if packet.cookie != COOKIE {
@@ -173,12 +196,36 @@ impl DhcpPacket {
 
     /// Serialize the DhcpPacket to bytes that can be written to a UDP socket.
     pub fn to_network(&self) -> Vec<u8> {
-        let mut data = vec![
-            u8::from(self.op),
-            u8::from(self.htype),
-            self.hlen,
-            self.hops,
-        ];
+        let mut options: Vec<u8>;
+        let mut file = self.file;
+        let mut sname = self.sname;
+
+        match self.max_client_message_size {
+            Some(max) => {
+                let max_options_len = cmp::max(max.into(), MIN_MAX_MESSAGE_LEN) - DHCP_HEADER_LEN;
+                let (options_data, file_data, sname_data) =
+                    self.options
+                        .to_network_overflow(max_options_len, file[0] == 0, sname[0] == 0);
+
+                options = options_data;
+
+                if let Some(fd) = file_data {
+                    file[0..fd.len()].copy_from_slice(&fd);
+                }
+                if let Some(sd) = sname_data {
+                    sname[0..sd.len()].copy_from_slice(&sd);
+                }
+            }
+            None => {
+                options = self.options.to_network();
+            }
+        }
+
+        let mut data = Vec::<u8>::with_capacity(1500);
+        data.push(u8::from(self.op));
+        data.push(u8::from(self.htype));
+        data.push(self.hlen);
+        data.push(self.hops);
         data.extend(self.xid.to_be_bytes());
         data.extend(self.secs.to_be_bytes());
         data.extend(self.flags.to_be_bytes());
@@ -187,18 +234,18 @@ impl DhcpPacket {
         data.extend(u32::from(self.siaddr).to_be_bytes());
         data.extend(u32::from(self.giaddr).to_be_bytes());
         data.extend(self.chaddr);
-        data.extend(self.sname);
-        data.extend(self.file);
+        data.extend(sname);
+        data.extend(file);
         data.extend(COOKIE);
 
         // Force a length of at least 300.  There are documented cases of clients
         // expecting the old BOOTP options of 64bytes (including cookie) making the
         // total packet size 300 bytes.
-        let mut options_data = self.options.to_network();
-        if options_data.len() < 60 {
-            options_data.extend(vec![0u8; 60 - options_data.len()]);
+        if options.len() < 60 {
+            options.extend(vec![0u8; 60 - options.len()]);
         }
-        data.extend(options_data);
+        data.extend(options);
+
         data
     }
 
@@ -353,10 +400,75 @@ impl DhcpOptions {
     pub fn to_network(&self) -> Vec<u8> {
         let mut bytes = vec![];
         for o in &self.options {
-            bytes.extend(o.to_network().to_vec());
+            bytes.extend(o.to_network());
         }
         bytes.push(255u8);
         bytes
+    }
+
+    /// Serialise the option set upto a maximum of `max` bytes.  If the options exceeds
+    /// `max` bytes, add option 52 and return a file field vec and a sname field in that order.
+    pub fn to_network_overflow(
+        &self,
+        max: usize,
+        use_file: bool,
+        use_sname: bool,
+    ) -> (Vec<u8>, Option<Vec<u8>>, Option<Vec<u8>>) {
+        const RESERVED_BYTES: usize = 4;
+        const FILE_BYTES: usize = 128;
+        const SNAME_BYTES: usize = 64;
+
+        let mut bytes = Vec::<u8>::with_capacity(max);
+        let mut file_bytes = Vec::<u8>::with_capacity(FILE_BYTES);
+        let mut sname_bytes = Vec::<u8>::with_capacity(SNAME_BYTES);
+
+        for o in &self.options {
+            let optbytes = o.to_network();
+
+            if bytes.len() + optbytes.len() + RESERVED_BYTES <= max {
+                bytes.extend(optbytes);
+                continue;
+            }
+
+            if use_file && file_bytes.len() + 1 + optbytes.len() <= FILE_BYTES {
+                file_bytes.extend(optbytes);
+                continue;
+            }
+
+            if use_sname && sname_bytes.len() + 1 + optbytes.len() <= SNAME_BYTES {
+                sname_bytes.extend(optbytes);
+                continue;
+            }
+
+            warn!(
+                "clients max message size limit resulted in options {} omitted.",
+                o.name(),
+            );
+        }
+
+        let mut overload_val = 0u8;
+        let mut ret_file_bytes: Option<Vec<u8>> = None;
+        let mut ret_sname_bytes: Option<Vec<u8>> = None;
+
+        if !file_bytes.is_empty() {
+            file_bytes.push(255u8);
+            ret_file_bytes = Some(file_bytes);
+            overload_val += 1;
+        }
+
+        if !sname_bytes.is_empty() {
+            sname_bytes.push(255u8);
+            ret_sname_bytes = Some(sname_bytes);
+            overload_val += 2;
+        }
+
+        if overload_val > 0 {
+            bytes.extend(DhcpOption::Overload(overload_val).to_network());
+        }
+
+        bytes.push(255u8);
+
+        (bytes, ret_file_bytes, ret_sname_bytes)
     }
 
     /// Return the option corresponding to the provided option code if it exists.
@@ -727,5 +839,169 @@ mod tests {
         assert_eq!(u8::from(response.op), 2); // BOOTREPLY
         assert_eq!(response.hops, 0);
         assert_eq!(response.secs, 0);
+    }
+
+    fn response_with_large_options(max_message_size: u16) -> Vec<u8> {
+        let request_options = [
+            53,
+            1,
+            1, // DHCPDISCOVER
+            57,
+            2,
+            (max_message_size >> 8) as u8,
+            max_message_size as u8, // Option 57
+            255,
+        ];
+
+        let request = DhcpPacket::from_network(&packet_with_header(&request_options))
+            .expect("request should decode");
+
+        let mut lease = crate::backends::Lease::default();
+
+        // Each option occupies 62 bytes on the wire:
+        // 1 byte code + 1 byte length + 60-byte payload.
+        let options = (0..8)
+            .map(|i| DhcpOption::DomainName(format!("option-{i}-{}", "x".repeat(51))))
+            .collect();
+
+        lease.options = Some(packet::DhcpOptions::new(Some(options)));
+
+        DhcpPacket::response(&request, lease).to_network()
+    }
+
+    #[test]
+    fn response_honours_option_57_maximum_message_size() {
+        let encoded = response_with_large_options(576);
+
+        assert!(
+            encoded.len() <= 576,
+            "response length {} exceeded option 57 limit",
+            encoded.len()
+        );
+    }
+
+    #[test]
+    fn response_uses_file_and_sname_for_option_overload() {
+        let encoded = response_with_large_options(576);
+
+        let main_options =
+            packet::DhcpOptions::from_network(&encoded[240..]).expect("main options should decode");
+
+        assert!(matches!(
+            main_options.get_option(52),
+            Some(DhcpOption::Overload(3))
+        ));
+
+        // Fixed-header offsets:
+        // sname = 44..108
+        // file  = 108..236
+        let file_options = packet::DhcpOptions::from_network(&encoded[108..236])
+            .expect("overloaded file options should decode");
+
+        let sname_options = packet::DhcpOptions::from_network(&encoded[44..108])
+            .expect("overloaded sname options should decode");
+
+        assert_eq!(file_options.options.len(), 2);
+        assert!(matches!(
+            &file_options.options[0],
+            DhcpOption::DomainName(value) if value.starts_with("option-5-")
+        ));
+        assert!(matches!(
+            &file_options.options[1],
+            DhcpOption::DomainName(value) if value.starts_with("option-6-")
+        ));
+
+        assert_eq!(sname_options.options.len(), 1);
+        assert!(matches!(
+            &sname_options.options[0],
+            DhcpOption::DomainName(value) if value.starts_with("option-7-")
+        ));
+
+        assert!(
+            encoded.len() <= 576,
+            "overloaded response length {} exceeded option 57 limit",
+            encoded.len()
+        );
+    }
+
+    fn response_with_large_options_using_fields(
+        max_message_size: u16,
+        use_file: bool,
+        use_sname: bool,
+    ) -> Vec<u8> {
+        let request_options = [
+            53,
+            1,
+            1, // DHCPDISCOVER
+            57,
+            2,
+            (max_message_size >> 8) as u8,
+            max_message_size as u8,
+            255,
+        ];
+
+        let request = DhcpPacket::from_network(&packet_with_header(&request_options))
+            .expect("request should decode");
+
+        let mut lease = crate::backends::Lease::default();
+
+        let options = (0..8)
+            .map(|i| DhcpOption::DomainName(format!("option-{i}-{}", "x".repeat(51))))
+            .collect();
+
+        lease.options = Some(packet::DhcpOptions::new(Some(options)));
+
+        let mut response = DhcpPacket::response(&request, lease);
+
+        // A non-zero first byte marks the field as already in use.
+        if !use_file {
+            response.file[0] = 1;
+        }
+
+        if !use_sname {
+            response.sname[0] = 1;
+        }
+
+        response.to_network()
+    }
+
+    #[test]
+    fn response_uses_file_only_for_option_overload() {
+        let encoded = response_with_large_options_using_fields(576, true, false);
+
+        let main_options =
+            packet::DhcpOptions::from_network(&encoded[240..]).expect("main options should decode");
+
+        assert!(matches!(
+            main_options.get_option(52),
+            Some(DhcpOption::Overload(1))
+        ));
+
+        let file_options = packet::DhcpOptions::from_network(&encoded[108..236])
+            .expect("file options should decode");
+
+        assert_eq!(file_options.options.len(), 2);
+        assert_eq!(encoded[44], 1); // sname was unavailable
+        assert!(encoded.len() <= 576);
+    }
+
+    #[test]
+    fn response_uses_sname_only_for_option_overload() {
+        let encoded = response_with_large_options_using_fields(576, false, true);
+
+        let main_options =
+            packet::DhcpOptions::from_network(&encoded[240..]).expect("main options should decode");
+
+        assert!(matches!(
+            main_options.get_option(52),
+            Some(DhcpOption::Overload(2))
+        ));
+
+        let sname_options = packet::DhcpOptions::from_network(&encoded[44..108])
+            .expect("sname options should decode");
+
+        assert_eq!(sname_options.options.len(), 1);
+        assert_eq!(encoded[108], 1); // file was unavailable
+        assert!(encoded.len() <= 576);
     }
 }

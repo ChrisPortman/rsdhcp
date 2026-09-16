@@ -140,14 +140,13 @@ impl NetboxDhcpLease {
 impl From<NetboxDhcpLease> for Lease {
     fn from(val: NetboxDhcpLease) -> Self {
         let mut p = Lease {
-            yiaddr: Some(val.ip_address.address.addr()),
+            yiaddr: Some(val.ip_address.address),
             lease_time: val.lease_time,
             lease_duration: val.expire_time - val.lease_time,
             ..Default::default()
         };
 
-        let mut opts: Vec<DhcpOption> =
-            vec![DhcpOption::SubnetMask(val.ip_address.address.netmask())];
+        let mut opts: Vec<DhcpOption> = Vec::with_capacity(6);
 
         if let Some(o) = val.gateway {
             opts.push(DhcpOption::Router(vec![o]));

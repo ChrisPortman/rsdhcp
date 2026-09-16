@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use chrono::{Duration, Utc};
-use ipnetwork::Ipv4Network;
+use ipnet::Ipv4Net;
 use log::info;
 
 use crate::backends::DhcpStore;
@@ -81,7 +81,7 @@ impl DatabaseMethods for Database {
     fn store_lease(&self, lease: Lease) {
         if let Some(ip) = lease.yiaddr {
             let mut db = self.lock().unwrap();
-            db.insert(ip, lease);
+            db.insert(ip.addr(), lease);
         }
     }
 
@@ -149,7 +149,7 @@ impl DhcpStore for Memory {
         // let mut lease = Lease::default();
         let mut lease = Lease {
             xid: packet.xid,
-            yiaddr: Some(ip.unwrap()),
+            yiaddr: Some(Ipv4Net::with_netmask(ip.unwrap(), self.subnet_mask).unwrap()),
             lease_duration: Duration::seconds(60 * 60), // 1 hour
             ..Default::default()
         };
@@ -262,8 +262,8 @@ impl DhcpStore for Memory {
         } else {
             *recv_ip
         };
-        if let Ok(requested_net) = Ipv4Network::with_netmask(requested_ip, subnet_mask)
-            && !requested_net.contains(origin_ip)
+        if let Ok(requested_net) = Ipv4Net::with_netmask(requested_ip, subnet_mask)
+            && !requested_net.contains(&origin_ip)
         {
             self.database.remove_lease(&requested_ip);
         }
@@ -333,9 +333,9 @@ impl DhcpStore for Memory {
         info!("Handling decline message");
 
         if let Some(lease) = self.database.get_lease_for_xid(packet.xid)
-            && let Some(yiadder) = lease.yiaddr
+            && let Some(yiaddr) = lease.yiaddr
         {
-            self.database.remove_lease(&yiadder);
+            self.database.remove_lease(&yiaddr.addr());
         }
         Ok(())
     }
@@ -358,9 +358,6 @@ impl Memory {
             match *c {
                 option::DhcpOption::ROUTER if !self.gateway.is_unspecified() => {
                     options.push(option::DhcpOption::Router(vec![self.gateway]));
-                }
-                option::DhcpOption::SUBNETMASK if !self.subnet_mask.is_unspecified() => {
-                    options.push(option::DhcpOption::SubnetMask(self.subnet_mask));
                 }
                 option::DhcpOption::DOMAINSERVER if !self.dns_servers.is_empty() => {
                     options.push(option::DhcpOption::DomainServer(self.dns_servers.clone()));
