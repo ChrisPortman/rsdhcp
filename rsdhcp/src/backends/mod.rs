@@ -9,6 +9,7 @@ use std::net::Ipv4Addr;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
+use ipnet::Ipv4Net;
 
 use crate::protocol::packet::{DhcpOptions, DhcpPacket};
 
@@ -41,7 +42,7 @@ impl fmt::Display for BackendError {
 #[derive(Debug, Clone)]
 pub struct Lease {
     pub xid: u32,
-    pub yiaddr: Option<Ipv4Addr>,
+    pub yiaddr: Option<Ipv4Net>,
     pub siaddr: Option<Ipv4Addr>,
     pub file: Option<[u8; 128]>,
     pub options: Option<DhcpOptions>,

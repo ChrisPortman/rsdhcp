@@ -94,6 +94,10 @@ pub fn dhcp_options(input: TokenStream) -> TokenStream {
                     }
                 }
 
+                pub fn name(&self) -> &'static str {
+                    "#name"
+                }
+
                 pub fn to_network(&self) -> Vec<u8> {
                     let mut bytes: Option<Vec<u8>> = match self {
                         #(#to_network_matches)*
