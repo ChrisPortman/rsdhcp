@@ -270,19 +270,40 @@ impl DhcpPacket {
             return Some(enums::ClientState::Init);
         }
 
-        if self.get_option(DhcpOption::DHCPSERVERID).is_some() {
-            return Some(enums::ClientState::Selecting);
+        if let Some(enums::MessageType::Request) = self.message_type() {
+            if self.ciaddr.is_unspecified()
+                && self.get_option(DhcpOption::DHCPSERVERID).is_some()
+                && self.get_option(DhcpOption::ADDRESSREQUEST).is_some()
+            {
+                return Some(enums::ClientState::Selecting);
+            }
+
+            if !self.is_broadcast()
+                && !self.ciaddr.is_unspecified()
+                && self.giaddr.is_unspecified()
+                && self.get_option(DhcpOption::DHCPSERVERID).is_none()
+                && self.get_option(DhcpOption::ADDRESSREQUEST).is_none()
+            {
+                return Some(enums::ClientState::Renewing);
+            }
+
+            if self.is_broadcast()
+                && !self.ciaddr.is_unspecified()
+                && self.get_option(DhcpOption::DHCPSERVERID).is_none()
+                && self.get_option(DhcpOption::ADDRESSREQUEST).is_none()
+            {
+                return Some(enums::ClientState::Rebinding);
+            }
+
+            if self.ciaddr.is_unspecified()
+                && self.get_option(DhcpOption::DHCPSERVERID).is_none()
+                && self.get_option(DhcpOption::ADDRESSREQUEST).is_some()
+            {
+                return Some(enums::ClientState::InitReboot);
+            }
         }
 
-        if !self.is_broadcast() && !self.ciaddr.is_unspecified() {
-            return Some(enums::ClientState::Renewing);
-        }
-
-        if self.is_broadcast() && !self.ciaddr.is_unspecified() && self.siaddr.is_unspecified() {
-            return Some(enums::ClientState::Rebinding);
-        }
-
-        Some(enums::ClientState::InitReboot)
+        None
     }
 
     /// Return true if the broadcast flag in the DhcpPacket is set.
