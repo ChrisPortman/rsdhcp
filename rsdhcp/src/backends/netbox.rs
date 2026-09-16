@@ -21,6 +21,10 @@ use crate::config;
 use crate::protocol::option::DhcpOption;
 use crate::protocol::packet;
 
+const DECLINED_CLIENT_ID: &str = "DECLINED";
+const DECLINED_HOSTNAME: &str = "DECLINED";
+const DECLINED_MAC_ADDRESS: &str = "00:00:00:00:00:00";
+
 #[derive(Serialize, Debug)]
 struct NetboxDhcpLeaseRequest {
     mac_address: String,
@@ -29,10 +33,6 @@ struct NetboxDhcpLeaseRequest {
     requested_ip: Option<Ipv4Addr>,
     hostname: Option<String>,
 }
-
-const DECLINED_CLIENT_ID: &str = "DECLINED";
-const DECLINED_HOSTNAME: &str = "DECLINED";
-const DECLINED_MAC_ADDRESS: &str = "00:00:00:00:00:00";
 
 impl From<&packet::DhcpPacket> for NetboxDhcpLeaseRequest {
     fn from(item: &packet::DhcpPacket) -> Self {
@@ -333,37 +333,41 @@ impl Netbox {
         };
 
         let client_id = get_client_id(packet);
-        let mut selected_lease: Option<NetboxDhcpLease> = None;
 
-        // Find an existing lease for the MAC address on the correct subnet
-        let existing_leases = self.get_leases_for_client_id(&client_id).await?;
-        for lease in existing_leases {
-            if lease.ip_address.address.contains(&compare_ip) {
-                selected_lease = Some(lease);
-                break;
-            }
+        // Find an existing lease for the client id on the correct subnet
+        let mut existing_leases = self.get_leases_for_client_id(&client_id).await?;
+        let existing_leases = existing_leases
+            .iter_mut()
+            .filter(|l| l.ip_address.address.contains(&compare_ip))
+            .collect::<Vec<_>>();
+
+        if existing_leases.is_empty() {
+            // We don't know this client at all on this subnet. remain silent
+            return Err(BackendError::NoLeaseAvailable());
         }
 
-        // Work out if the lease is correct per the request (ciaddr or requested ip) match the
-        // lease
-        if let Some(mut lease) = selected_lease {
+        // We know this client on this subnet.  If none of the leases we have for the client
+        // on the subnet match the clients expected IP address, we need to nak it.
+        // This handles an edge case that therortically should not happen - multple leases for
+        // the samme client id in on the same subnet.  If any of them match we will refresh it.
+        for lease in existing_leases {
             if !packet.ciaddr.is_unspecified() && packet.ciaddr != lease.ip_address.address.addr() {
-                return Err(BackendError::LeaseMismatchClientIP());
+                continue;
             }
 
             if let Some(DhcpOption::AddressRequest(req_ip)) =
                 packet.get_option(DhcpOption::ADDRESSREQUEST)
                 && *req_ip != lease.ip_address.address.addr()
             {
-                return Err(BackendError::LeaseMismatchClientIP());
+                continue;
             }
 
             lease.update_from_packet(packet);
             lease.acknowledge(&self.client).await?;
-            return Ok(lease);
+            return Ok(lease.clone());
         }
 
-        Err(BackendError::NoLeaseAvailable())
+        Err(BackendError::LeaseMismatchClientIP())
     }
 
     async fn delete_lease(&self, packet: &packet::DhcpPacket) -> Result<(), BackendError> {
