@@ -465,15 +465,6 @@ impl DhcpStore for Netbox {
     }
 }
 
-fn u8_to_hex(bytes: &[u8]) -> String {
-    let mut mac_octets: Vec<String> = vec![];
-    for b in bytes {
-        mac_octets.push(format!("{:02X?}", b));
-    }
-
-    mac_octets.join(":")
-}
-
 async fn send_request(request: RequestBuilder) -> Result<reqwest::Response, BackendError> {
     match request.send().await {
         Ok(r) => {
@@ -495,6 +486,15 @@ async fn send_request(request: RequestBuilder) -> Result<reqwest::Response, Back
         }
         Err(e) => Err(BackendError::BackendError(e.to_string())),
     }
+}
+
+fn u8_to_hex(bytes: &[u8]) -> String {
+    let mut mac_octets: Vec<String> = vec![];
+    for b in bytes {
+        mac_octets.push(format!("{:02X?}", b));
+    }
+
+    mac_octets.join(":")
 }
 
 fn get_client_id(packet: &packet::DhcpPacket) -> String {

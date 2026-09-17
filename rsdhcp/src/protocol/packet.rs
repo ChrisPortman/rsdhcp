@@ -342,8 +342,9 @@ impl DhcpPacket {
 
     pub fn hex_chaddr(&self) -> String {
         let mut s = String::with_capacity(20);
+        let hlen = cmp::min(self.hlen, 16);
 
-        for i in 0..self.hlen {
+        for i in 0..hlen {
             s.push_str(format!("{:02X?}", self.chaddr[i as usize]).as_str());
 
             if i < self.hlen - 1 {
