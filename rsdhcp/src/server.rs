@@ -15,7 +15,8 @@ use tokio::net::UdpSocket;
 use crate::backends::{BackendError, DhcpStore, Lease};
 use crate::protocol::enums::MessageType;
 use crate::protocol::option::DhcpOption;
-use crate::protocol::{enums, option, packet};
+use crate::protocol::packet::DhcpPacket;
+use crate::protocol::{enums, errors, option, packet};
 
 const RECV_BUF_SIZE: usize = 4096;
 
@@ -316,23 +317,22 @@ async fn process_packet_data<T: DhcpStore>(sock: Arc<UdpSocket>, packet: Packet,
             },
         };
 
-        let mut dst_ip = Ipv4Addr::new(255, 255, 255, 255);
-        let mut dst_p = enums::DHCP_CLIENT_PORT;
-
-        if !dhcp_packet.giaddr.is_unspecified() {
-            dst_ip = dhcp_packet.giaddr;
-            dst_p = enums::DHCP_SERVER_PORT;
-        } else if !dhcp_packet.return_broadcast() && !dhcp_packet.ciaddr.is_unspecified() {
-            dst_ip = dhcp_packet.ciaddr;
-        }
+        let dest = match determine_response_dest(&dhcp_packet, &response) {
+            Ok(d) => d,
+            Err(e) => {
+                error!("{}", e);
+                return;
+            }
+        };
 
         debug!(
             "sending response packet to {}:{} - {}",
-            dst_ip, dst_p, response
+            dest.ip(),
+            dest.port(),
+            response
         );
-        let dst = format!("{}:{}", dst_ip, dst_p);
-        if sock.send_to(&response.to_network(), dst).await.is_err() {
-            print!("Failed to send response");
+        if sock.send_to(&response.to_network(), dest).await.is_err() {
+            error!("Failed to send response");
         }
 
         info!(
@@ -359,6 +359,59 @@ async fn process_packet_data<T: DhcpStore>(sock: Arc<UdpSocket>, packet: Packet,
             }
         );
     }
+}
+
+fn determine_response_dest(
+    request: &DhcpPacket,
+    response: &DhcpPacket,
+) -> Result<SocketAddrV4, errors::PacketError> {
+    if !request.giaddr.is_unspecified() {
+        return Ok(SocketAddrV4::new(request.giaddr, enums::DHCP_SERVER_PORT));
+    }
+
+    if let Some(MessageType::NegAcknowledge) = response.message_type() {
+        return Ok(SocketAddrV4::new(
+            Ipv4Addr::BROADCAST,
+            enums::DHCP_CLIENT_PORT,
+        ));
+    }
+
+    if !request.ciaddr.is_unspecified() {
+        return Ok(SocketAddrV4::new(request.ciaddr, enums::DHCP_CLIENT_PORT));
+    }
+
+    if request.return_broadcast() {
+        return Ok(SocketAddrV4::new(
+            Ipv4Addr::BROADCAST,
+            enums::DHCP_CLIENT_PORT,
+        ));
+    }
+
+    if !response.yiaddr.is_unspecified() {
+        // RFC 2131, Section 4.1 states that a packet with:
+        // * The broadcast flag set 0; and
+        // * giaddr set 0; and
+        // * ciaddr set 0; and
+        // * yiaddr set not 0
+        // SHOULD be unicast to the `yiaddr` AND the link layer address in `chaddr`.
+        //
+        // It goes on to say that if for a hardware or software reason, unicast is not
+        // feasible, the server MAY fallback to broadcasting to IP ffffff and the broadcast
+        // link layer address.
+        //
+        // We can not set the link layer address manually to chaddr, and the client may
+        // not be configured enough yet to respond to ARP requests.
+        //
+        // We will fall back to broadcast.
+        return Ok(SocketAddrV4::new(
+            Ipv4Addr::BROADCAST,
+            enums::DHCP_CLIENT_PORT,
+        ));
+    }
+
+    Err(errors::PacketError::new(
+        "state voilation. requst/response does not match a return address condition",
+    ))
 }
 
 fn enable_ip_pktinfo(fd: i32) -> Result<(), io::Error> {
@@ -423,4 +476,92 @@ fn receive_packet(fd: RawFd, buffer: &mut [u8]) -> io::Result<PacketMetadata> {
         destination,
         // interface_index,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::determine_response_dest;
+    use crate::backends::Lease;
+    use crate::protocol::packet::DhcpPacket;
+    use std::net::{Ipv4Addr, SocketAddrV4};
+
+    fn request() -> DhcpPacket {
+        let mut raw = vec![0u8; 240];
+        raw[236..240].copy_from_slice(&[99, 130, 83, 99]);
+        raw.extend_from_slice(&[53, 1, 3, 255]); // DHCPREQUEST, END
+
+        DhcpPacket::from_network(&raw, false).expect("test request should decode")
+    }
+
+    fn ack(request: &DhcpPacket, yiaddr: Ipv4Addr) -> DhcpPacket {
+        let mut response = DhcpPacket::response(request, Lease::default());
+        response.yiaddr = yiaddr;
+        response
+    }
+
+    #[test]
+    fn relay_destination_takes_precedence() {
+        let mut request = request();
+        request.giaddr = Ipv4Addr::new(192, 0, 2, 1);
+        request.ciaddr = Ipv4Addr::new(192, 0, 2, 20);
+        request.flags = 0x8000;
+
+        let response = DhcpPacket::nak(&request);
+        let destination = determine_response_dest(&request, &response).unwrap();
+
+        assert_eq!(destination, SocketAddrV4::new(request.giaddr, 67));
+    }
+
+    #[test]
+    fn nak_without_relay_is_broadcast() {
+        let mut request = request();
+        request.ciaddr = Ipv4Addr::new(192, 0, 2, 20);
+
+        let response = DhcpPacket::nak(&request);
+        let destination = determine_response_dest(&request, &response).unwrap();
+
+        assert_eq!(destination, SocketAddrV4::new(Ipv4Addr::BROADCAST, 68));
+    }
+
+    #[test]
+    fn ciaddr_takes_precedence_over_broadcast_flag() {
+        let mut request = request();
+        request.ciaddr = Ipv4Addr::new(192, 0, 2, 20);
+        request.flags = 0x8000;
+
+        let response = ack(&request, Ipv4Addr::new(192, 0, 2, 21));
+        let destination = determine_response_dest(&request, &response).unwrap();
+
+        assert_eq!(destination, SocketAddrV4::new(request.ciaddr, 68));
+    }
+
+    #[test]
+    fn broadcast_flag_selects_limited_broadcast() {
+        let mut request = request();
+        request.flags = 0x8000;
+
+        let response = ack(&request, Ipv4Addr::new(192, 0, 2, 21));
+        let destination = determine_response_dest(&request, &response).unwrap();
+
+        assert_eq!(destination, SocketAddrV4::new(Ipv4Addr::BROADCAST, 68));
+    }
+
+    #[test]
+    fn broadcast_is_used_where_yiaddr_is_set() {
+        let request = request();
+        let yiaddr = Ipv4Addr::new(192, 0, 2, 21);
+
+        let response = ack(&request, yiaddr);
+        let destination = determine_response_dest(&request, &response).unwrap();
+
+        assert_eq!(destination, SocketAddrV4::new(Ipv4Addr::BROADCAST, 68));
+    }
+
+    #[test]
+    fn missing_destination_returns_an_error() {
+        let request = request();
+        let response = DhcpPacket::response(&request, Lease::default());
+
+        assert!(determine_response_dest(&request, &response).is_err());
+    }
 }

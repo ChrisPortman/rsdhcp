@@ -1,5 +1,5 @@
-pub const DHCP_SERVER_PORT: usize = 67;
-pub const DHCP_CLIENT_PORT: usize = 68;
+pub const DHCP_SERVER_PORT: u16 = 67;
+pub const DHCP_CLIENT_PORT: u16 = 68;
 
 #[repr(u8)]
 #[derive(Debug, Copy, Clone)]
