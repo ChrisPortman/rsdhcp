@@ -128,6 +128,12 @@ impl DhcpPacket {
         let op = enums::DhcpOperation::BootReply;
         let msg_type = enums::MessageType::NegAcknowledge;
 
+        let mut flags = self.flags;
+        if !self.giaddr.is_unspecified() {
+            // set the broadcast flag so the relay will broadcast to the client.
+            flags = 0x8000;
+        }
+
         let mut new = Self {
             op,
             htype: self.htype,
@@ -135,7 +141,7 @@ impl DhcpPacket {
             hops: 0,
             xid: self.xid,
             secs: 0,
-            flags: self.flags,
+            flags,
             ciaddr: Ipv4Addr::UNSPECIFIED,
             yiaddr: Ipv4Addr::UNSPECIFIED,
             siaddr: Ipv4Addr::UNSPECIFIED,
