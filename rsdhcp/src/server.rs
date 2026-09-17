@@ -1,12 +1,32 @@
+use std::io::{self, IoSliceMut};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::os::fd::{AsRawFd, RawFd};
+use std::sync::Arc;
+
+use log::{error, info};
+use nix::errno::Errno;
+use nix::ifaddrs::getifaddrs;
+use nix::sys::socket::{ControlMessageOwned, MsgFlags, SockaddrStorage, recvmsg};
+use socket2::{Domain, Protocol, Socket, Type};
+use tokio::net::UdpSocket;
+
 use crate::backends::{BackendError, DhcpStore, Lease};
 use crate::protocol::{enums, option, packet};
-use log::{error, info};
-use nix::ifaddrs::getifaddrs;
-use socket2::{Domain, Protocol, Socket, Type};
-use std::io;
-use std::net::{Ipv4Addr, SocketAddrV4};
-use std::sync::Arc;
-use tokio::net::UdpSocket;
+
+const RECV_BUF_SIZE: usize = 4096;
+
+struct PacketMetadata {
+    length: usize,
+    source: Option<SocketAddr>,
+    destination: Option<Ipv4Addr>,
+    // interface_index: Option<u32>,
+}
+
+struct Packet {
+    meta: PacketMetadata,
+    recv_ip: Ipv4Addr,
+    data: [u8; RECV_BUF_SIZE],
+}
 
 /// Server represents the DHCP server using the provided store.
 pub struct Server<T: DhcpStore + Sync + Send + 'static> {
@@ -98,6 +118,12 @@ impl<T: DhcpStore + Sync + Send + 'static> IPServer<T> {
             return Err(e);
         }
 
+        // enable IP_PKTINFO
+        if let Err(e) = enable_ip_pktinfo(sock.as_raw_fd()) {
+            error!("Could not enable PKTINFO: {}", e);
+            return Err(e);
+        }
+
         let sock_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 67);
         if let Err(e) = sock.bind(&sock_addr.into()) {
             error!("Could not bind to {}: {}", self.iface_name, e);
@@ -118,38 +144,51 @@ impl<T: DhcpStore + Sync + Send + 'static> IPServer<T> {
         };
 
         let socket_arc = Arc::new(socket);
-        let mut src: std::net::SocketAddr;
+        let mut buffer = [0u8; 4096];
 
         loop {
             info!("waiting for packet on {}", self.ip);
-            let mut buf = Vec::with_capacity(1500);
-            match socket_arc.recv_buf_from(&mut buf).await {
-                Ok(r) => (_, src) = r,
+            if let Err(e) = socket_arc.readable().await {
+                error!("error waiting for socket data: {}", e);
+                continue;
+            }
+
+            let meta = match receive_packet(socket_arc.as_raw_fd(), &mut buffer) {
+                Ok(meta) => meta,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
                 Err(e) => {
-                    error!("Reading from network failed: {}", e);
+                    error!("error reading data from socket: {}", e);
                     continue;
                 }
             };
 
-            info!("Data received on IP {} from {}", self.ip, src.ip());
+            info!("Data received on IP {} from {:?}", self.ip, meta.source);
             let ip = self.ip;
             let sock = socket_arc.clone();
             let store = self.store.clone();
 
+            let packet = Packet {
+                meta,
+                recv_ip: ip,
+                data: buffer,
+            };
+
             // Launch a task to process the data
-            tokio::spawn(async move { process_packet_data(ip, sock, buf, store).await });
+            tokio::spawn(async move { process_packet_data(sock, packet, store).await });
         }
     }
 }
 
 /// Processes a single UDP datagram containing a DHCP packet.
-async fn process_packet_data<T: DhcpStore>(
-    server_ip: Ipv4Addr,
-    sock: Arc<UdpSocket>,
-    data: Vec<u8>,
-    store: Arc<T>,
-) {
-    let packet = match packet::DhcpPacket::from_network(&data) {
+async fn process_packet_data<T: DhcpStore>(sock: Arc<UdpSocket>, packet: Packet, store: Arc<T>) {
+    let data = &packet.data[0..packet.meta.length];
+
+    let broadcast = match packet.meta.destination {
+        Some(dst) => dst.is_broadcast(),
+        None => false,
+    };
+
+    let dhcp_packet = match packet::DhcpPacket::from_network(data, broadcast) {
         Ok(p) => p,
         Err(e) => {
             error!("Failed to decode bytes from network: {}", e);
@@ -157,31 +196,31 @@ async fn process_packet_data<T: DhcpStore>(
         }
     };
 
-    info!("Received packet: {}", packet);
+    info!("Received packet: {}", dhcp_packet);
 
     if let Some(option::DhcpOption::DhcpServerId(o)) =
-        packet.get_option(option::DhcpOption::DHCPSERVERID)
-        && *o != server_ip
+        dhcp_packet.get_option(option::DhcpOption::DHCPSERVERID)
+        && *o != packet.recv_ip
     {
         return;
     }
 
-    let mut recv_ip = server_ip;
-    if !packet.giaddr.is_unspecified() {
-        recv_ip = packet.giaddr;
+    let mut recv_ip = packet.recv_ip;
+    if !dhcp_packet.giaddr.is_unspecified() {
+        recv_ip = dhcp_packet.giaddr;
     }
 
-    if let Some(message_type) = packet.message_type() {
+    if let Some(message_type) = dhcp_packet.message_type() {
         // Release and decline require no response.
         match message_type {
             enums::MessageType::Release => {
-                if let Err(e) = store.handle_release(&packet).await {
+                if let Err(e) = store.handle_release(&dhcp_packet).await {
                     error!("Error processing release: {}", e);
                 }
                 return;
             }
             enums::MessageType::Decline => {
-                if let Err(e) = store.handle_decline(&packet).await {
+                if let Err(e) = store.handle_decline(&dhcp_packet).await {
                     error!("Error processing decline: {}", e);
                 }
                 return;
@@ -190,24 +229,26 @@ async fn process_packet_data<T: DhcpStore>(
         };
 
         let lease_result: Result<Lease, BackendError> = match message_type {
-            enums::MessageType::Discover => store.handle_discover(&recv_ip, &packet).await,
-            enums::MessageType::Request => match packet.client_state() {
+            enums::MessageType::Discover => store.handle_discover(&recv_ip, &dhcp_packet).await,
+            enums::MessageType::Request => match dhcp_packet.client_state() {
                 Some(state) => match state {
                     enums::ClientState::Selecting => {
                         info!("client is in the SELECTING state");
-                        store.handle_request_selecting(&recv_ip, &packet).await
+                        store.handle_request_selecting(&recv_ip, &dhcp_packet).await
                     }
                     enums::ClientState::InitReboot => {
                         info!("client is in the INIT REBOOT state");
-                        store.handle_request_init_reboot(&recv_ip, &packet).await
+                        store
+                            .handle_request_init_reboot(&recv_ip, &dhcp_packet)
+                            .await
                     }
                     enums::ClientState::Renewing => {
                         info!("client is in the RENEWING state");
-                        store.handle_request_renewing(&recv_ip, &packet).await
+                        store.handle_request_renewing(&recv_ip, &dhcp_packet).await
                     }
                     enums::ClientState::Rebinding => {
                         info!("client is in the REBINDING state");
-                        store.handle_request_rebinding(&recv_ip, &packet).await
+                        store.handle_request_rebinding(&recv_ip, &dhcp_packet).await
                     }
                     enums::ClientState::Init => {
                         error!("client is in the INIT state");
@@ -218,7 +259,7 @@ async fn process_packet_data<T: DhcpStore>(
                     "could not determine client state".to_string(),
                 )),
             },
-            enums::MessageType::Inform => store.handle_inform(&recv_ip, &packet).await,
+            enums::MessageType::Inform => store.handle_inform(&recv_ip, &dhcp_packet).await,
             _ => Err(BackendError::ProtocolError(
                 "unknown message type".to_string(),
             )),
@@ -227,13 +268,13 @@ async fn process_packet_data<T: DhcpStore>(
         let response: packet::DhcpPacket = match lease_result {
             Ok(mut lease) => {
                 info!("resolved lease: {:?}", lease);
-                lease.server_identifier = server_ip;
-                packet.response(lease)
+                lease.server_identifier = packet.recv_ip;
+                dhcp_packet.response(lease)
             }
             Err(e) => match e {
                 BackendError::LeaseMismatchClientIP() => {
                     error!("Resonding with NAK due to inconsistent lease information");
-                    packet::DhcpPacket::nak(&packet)
+                    packet::DhcpPacket::nak(&dhcp_packet)
                 }
                 BackendError::NoLeaseAvailable() => {
                     error!("{}", e);
@@ -249,11 +290,11 @@ async fn process_packet_data<T: DhcpStore>(
         let mut dst_ip = Ipv4Addr::new(255, 255, 255, 255);
         let mut dst_p = enums::DHCP_CLIENT_PORT;
 
-        if !packet.giaddr.is_unspecified() {
-            dst_ip = packet.giaddr;
+        if !dhcp_packet.giaddr.is_unspecified() {
+            dst_ip = dhcp_packet.giaddr;
             dst_p = enums::DHCP_SERVER_PORT;
-        } else if !packet.is_broadcast() && !packet.ciaddr.is_unspecified() {
-            dst_ip = packet.ciaddr;
+        } else if !dhcp_packet.return_broadcast() && !dhcp_packet.ciaddr.is_unspecified() {
+            dst_ip = dhcp_packet.ciaddr;
         }
 
         info!(
@@ -265,4 +306,68 @@ async fn process_packet_data<T: DhcpStore>(
             print!("Failed to send response");
         }
     }
+}
+
+fn enable_ip_pktinfo(fd: i32) -> Result<(), io::Error> {
+    let enabled: libc::c_int = 1;
+
+    let result = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_IP,
+            libc::IP_PKTINFO,
+            (&enabled as *const libc::c_int).cast(),
+            std::mem::size_of_val(&enabled) as libc::socklen_t,
+        )
+    };
+
+    if result == -1 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn errno_to_io(error: Errno) -> io::Error {
+    io::Error::from_raw_os_error(error as i32)
+}
+
+fn receive_packet(fd: RawFd, buffer: &mut [u8]) -> io::Result<PacketMetadata> {
+    let mut iov = [IoSliceMut::new(buffer)];
+
+    let mut control_buffer = nix::cmsg_space!(libc::in_pktinfo);
+
+    let message = recvmsg::<SockaddrStorage>(
+        fd,
+        &mut iov,
+        Some(&mut control_buffer),
+        MsgFlags::MSG_DONTWAIT,
+    )
+    .map_err(errno_to_io)?;
+
+    let source = message.address.as_ref().and_then(|address| {
+        address
+            .as_sockaddr_in()
+            .map(|address| SocketAddr::V4(SocketAddrV4::new(address.ip(), address.port())))
+    });
+
+    let mut destination = None;
+    // let mut interface_index = None;
+
+    for control_message in message.cmsgs().map_err(errno_to_io)? {
+        if let ControlMessageOwned::Ipv4PacketInfo(packet_info) = control_message {
+            let destination_u32 = u32::from_be(packet_info.ipi_addr.s_addr);
+
+            destination = Some(Ipv4Addr::from(destination_u32.to_be_bytes()));
+
+            // interface_index = Some(packet_info.ipi_ifindex as u32);
+        }
+    }
+
+    Ok(PacketMetadata {
+        length: message.bytes,
+        source,
+        destination,
+        // interface_index,
+    })
 }
