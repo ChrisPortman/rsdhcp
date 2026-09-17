@@ -1,4 +1,5 @@
 use rsdhcp_macros::DhcpOptions;
+use std::fmt::{Debug, Display};
 use std::net::Ipv4Addr;
 
 use crate::protocol::enums::MessageType;
@@ -157,12 +158,101 @@ pub enum DhcpOption {
     StreetTalkServer(Vec<Ipv4Addr>),
     #[code(76)]
     StdaServer(Vec<Ipv4Addr>),
+    #[code(80)]
+    ServiceLocationProtocolNamingAuthority(Vec<u8>),
+    #[code(81)]
+    ClientFullyQualifiedDomainName(ClientFqdn),
     #[code(82)]
     RelayAgentInformation(Vec<u8>),
     #[code(119)]
     DomainSearch(Vec<u8>),
     #[code(255)]
     End,
+}
+
+#[derive(Clone)]
+pub struct ClientFqdn {
+    pub flags: u8,
+    pub domain_name: Vec<u8>,
+}
+
+impl ValueSerde for ClientFqdn {
+    fn from_network(bytes: &[u8]) -> Result<Self, PacketError>
+    where
+        Self: Sized,
+    {
+        // 1 flags
+        // 1 RCODE1 (ignored)
+        // 1 RCODE2 (ignored)
+        // >= 1 Domain Name
+        if bytes.len() < 4 {
+            return Err(PacketError::new(
+                "ClientFqdn option should be at least 4 bytes",
+            ));
+        }
+
+        Ok(Self {
+            flags: bytes[0],
+            domain_name: bytes[3..bytes.len()].to_vec(),
+        })
+    }
+
+    fn to_network(&self) -> Vec<u8> {
+        let mut data = Vec::with_capacity(3 + self.domain_name.len());
+        data.push(self.flags);
+        data.push(255);
+        data.push(255);
+        data.extend(&self.domain_name);
+
+        data
+    }
+}
+
+impl Display for ClientFqdn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.flags & 4u8 == 4 {
+            // Wire formant
+            let mut offset = 0;
+
+            while let Some(l) = self.domain_name.get(offset) {
+                let part_len = *l;
+
+                if part_len == 0 {
+                    break;
+                }
+
+                offset += 1;
+                let part_end = offset + usize::from(part_len);
+
+                match self.domain_name.get(offset..part_end) {
+                    Some(part_bytes) => {
+                        match str::from_utf8(part_bytes) {
+                            Ok(part) => write!(f, "{}.", part)?,
+                            _ => break,
+                        };
+                    }
+                    None => break,
+                }
+
+                offset = part_end;
+            }
+
+            return Ok(());
+        }
+
+        // Ascii
+        if let Ok(s) = str::from_utf8(&self.domain_name) {
+            return write!(f, "{}", s);
+        }
+
+        Ok(())
+    }
+}
+
+impl Debug for ClientFqdn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self)
+    }
 }
 
 /// Defines required behavior to serialise to and from the network according to
@@ -407,7 +497,7 @@ mod tests {
     use std::net::Ipv4Addr;
     use std::panic::catch_unwind;
 
-    use crate::protocol::option::{DhcpOption, ValueSerde};
+    use crate::protocol::option::{ClientFqdn, DhcpOption, ValueSerde};
 
     #[test]
     fn test_endianess() {
@@ -701,5 +791,31 @@ mod tests {
             assert_rfc2132_wire_format(code, one);
             assert_rfc2132_wire_format(code, multiple);
         }
+    }
+
+    #[test]
+    fn test_display_client_fqdn_wire() {
+        let cf = ClientFqdn {
+            flags: 5, // 00000101
+            domain_name: vec![
+                7, 116, 101, 115, 116, 105, 110, 103, 7, 101, 120, 97, 109, 112, 108, 101, 3, 99,
+                111, 109, 0,
+            ],
+        };
+
+        assert_eq!(format!("{}", cf), "testing.example.com.");
+    }
+
+    #[test]
+    fn test_display_client_fqdn_ascii() {
+        let cf = ClientFqdn {
+            flags: 3, // 00000011
+            domain_name: vec![
+                116, 101, 115, 116, 105, 110, 103, 46, 101, 120, 97, 109, 112, 108, 101, 46, 99,
+                111, 109,
+            ],
+        };
+
+        assert_eq!(format!("{}", cf), "testing.example.com");
     }
 }

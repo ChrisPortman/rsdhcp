@@ -3,14 +3,18 @@ use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::os::fd::{AsRawFd, RawFd};
 use std::sync::Arc;
 
-use log::{error, info};
+use chrono::{Duration, Utc};
+use log::{debug, error, info, warn};
 use nix::errno::Errno;
 use nix::ifaddrs::getifaddrs;
 use nix::sys::socket::{ControlMessageOwned, MsgFlags, SockaddrStorage, recvmsg};
 use socket2::{Domain, Protocol, Socket, Type};
+use tokio::io::Interest;
 use tokio::net::UdpSocket;
 
 use crate::backends::{BackendError, DhcpStore, Lease};
+use crate::protocol::enums::MessageType;
+use crate::protocol::option::DhcpOption;
 use crate::protocol::{enums, option, packet};
 
 const RECV_BUF_SIZE: usize = 4096;
@@ -147,13 +151,15 @@ impl<T: DhcpStore + Sync + Send + 'static> IPServer<T> {
         let mut buffer = [0u8; 4096];
 
         loop {
-            info!("waiting for packet on {}", self.ip);
+            debug!("waiting for packet on {}", self.ip);
             if let Err(e) = socket_arc.readable().await {
                 error!("error waiting for socket data: {}", e);
                 continue;
             }
 
-            let meta = match receive_packet(socket_arc.as_raw_fd(), &mut buffer) {
+            let meta = match socket_arc.try_io(Interest::READABLE, || {
+                receive_packet(socket_arc.as_raw_fd(), &mut buffer)
+            }) {
                 Ok(meta) => meta,
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
                 Err(e) => {
@@ -162,7 +168,14 @@ impl<T: DhcpStore + Sync + Send + 'static> IPServer<T> {
                 }
             };
 
-            info!("Data received on IP {} from {:?}", self.ip, meta.source);
+            info!(
+                "Data received on IP {} from {}",
+                self.ip,
+                meta.source
+                    .map(|a| a.to_string())
+                    .unwrap_or(String::from("unknown")),
+            );
+
             let ip = self.ip;
             let sock = socket_arc.clone();
             let store = self.store.clone();
@@ -196,7 +209,7 @@ async fn process_packet_data<T: DhcpStore>(sock: Arc<UdpSocket>, packet: Packet,
         }
     };
 
-    info!("Received packet: {}", dhcp_packet);
+    debug!("Received packet: {}", dhcp_packet);
 
     if let Some(option::DhcpOption::DhcpServerId(o)) =
         dhcp_packet.get_option(option::DhcpOption::DHCPSERVERID)
@@ -217,12 +230,28 @@ async fn process_packet_data<T: DhcpStore>(sock: Arc<UdpSocket>, packet: Packet,
                 if let Err(e) = store.handle_release(&dhcp_packet).await {
                     error!("Error processing release: {}", e);
                 }
+                info!(
+                    "lease released by MAC: {}, IP: {}",
+                    dhcp_packet.hex_chaddr(),
+                    dhcp_packet.yiaddr,
+                );
+
                 return;
             }
             enums::MessageType::Decline => {
                 if let Err(e) = store.handle_decline(&dhcp_packet).await {
                     error!("Error processing decline: {}", e);
                 }
+
+                warn!(
+                    "lease declined by MAC: {}, IP: {}",
+                    dhcp_packet.hex_chaddr(),
+                    match dhcp_packet.get_option(DhcpOption::ADDRESSREQUEST) {
+                        Some(DhcpOption::AddressRequest(a)) => a.to_string(),
+                        _ => String::from("UNKNOWN"),
+                    },
+                );
+
                 return;
             }
             _ => {}
@@ -233,21 +262,21 @@ async fn process_packet_data<T: DhcpStore>(sock: Arc<UdpSocket>, packet: Packet,
             enums::MessageType::Request => match dhcp_packet.client_state() {
                 Some(state) => match state {
                     enums::ClientState::Selecting => {
-                        info!("client is in the SELECTING state");
+                        debug!("client is in the SELECTING state");
                         store.handle_request_selecting(&recv_ip, &dhcp_packet).await
                     }
                     enums::ClientState::InitReboot => {
-                        info!("client is in the INIT REBOOT state");
+                        debug!("client is in the INIT REBOOT state");
                         store
                             .handle_request_init_reboot(&recv_ip, &dhcp_packet)
                             .await
                     }
                     enums::ClientState::Renewing => {
-                        info!("client is in the RENEWING state");
+                        debug!("client is in the RENEWING state");
                         store.handle_request_renewing(&recv_ip, &dhcp_packet).await
                     }
                     enums::ClientState::Rebinding => {
-                        info!("client is in the REBINDING state");
+                        debug!("client is in the REBINDING state");
                         store.handle_request_rebinding(&recv_ip, &dhcp_packet).await
                     }
                     enums::ClientState::Init => {
@@ -267,7 +296,7 @@ async fn process_packet_data<T: DhcpStore>(sock: Arc<UdpSocket>, packet: Packet,
 
         let response: packet::DhcpPacket = match lease_result {
             Ok(mut lease) => {
-                info!("resolved lease: {:?}", lease);
+                debug!("resolved lease: {:?}", lease);
                 lease.server_identifier = packet.recv_ip;
                 dhcp_packet.response(lease)
             }
@@ -297,7 +326,7 @@ async fn process_packet_data<T: DhcpStore>(sock: Arc<UdpSocket>, packet: Packet,
             dst_ip = dhcp_packet.ciaddr;
         }
 
-        info!(
+        debug!(
             "sending response packet to {}:{} - {}",
             dst_ip, dst_p, response
         );
@@ -305,6 +334,30 @@ async fn process_packet_data<T: DhcpStore>(sock: Arc<UdpSocket>, packet: Packet,
         if sock.send_to(&response.to_network(), dst).await.is_err() {
             print!("Failed to send response");
         }
+
+        info!(
+            "lease {} for {} ({:?}): IP: {}, Mask: {}, Expires: {}",
+            match response.message_type() {
+                Some(MessageType::Offer) => "offered",
+                Some(MessageType::Acknowledge) => "acknowledged",
+                _ => "processed",
+            },
+            response.hex_chaddr(),
+            match dhcp_packet.client_state() {
+                Some(state) => state,
+                None => enums::ClientState::Init, // should not happen
+            },
+            response.yiaddr,
+            match response.get_option(DhcpOption::SUBNETMASK) {
+                Some(DhcpOption::SubnetMask(m)) => m.to_string(),
+                _ => String::from("unknown"),
+            },
+            match response.get_option(DhcpOption::ADDRESSTIME) {
+                Some(DhcpOption::AddressTime(t)) =>
+                    (Utc::now() + Duration::seconds(i64::from(*t))).to_rfc3339(),
+                _ => String::from("unknown"),
+            }
+        );
     }
 }
 

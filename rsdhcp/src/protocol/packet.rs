@@ -339,6 +339,20 @@ impl DhcpPacket {
 
         self.received_by_broadcast
     }
+
+    pub fn hex_chaddr(&self) -> String {
+        let mut s = String::with_capacity(20);
+
+        for i in 0..self.hlen {
+            s.push_str(format!("{:02X?}", self.chaddr[i as usize]).as_str());
+
+            if i < self.hlen - 1 {
+                s.push(':');
+            }
+        }
+
+        s
+    }
 }
 
 impl Display for DhcpPacket {
@@ -649,6 +663,13 @@ mod tests {
             .iter()
             .map(DhcpOption::code)
             .collect()
+    }
+
+    #[test]
+    fn hex_chaddr_constructs_a_mac_address_string() {
+        let packet = DhcpPacket::from_network(&packet_with_header(&[]), false)
+            .expect("complete DHCP packet should decode");
+        assert_eq!(packet.hex_chaddr(), "00:11:22:33:44:55");
     }
 
     #[test]

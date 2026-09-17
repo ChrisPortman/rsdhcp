@@ -3,7 +3,7 @@ use std::fs::File;
 use std::thread::sleep;
 use std::time::Duration;
 
-use log::info;
+use log::{debug, info};
 
 use rsdhcp::backends::memory::Memory;
 use rsdhcp::backends::netbox::Netbox;
@@ -50,7 +50,7 @@ async fn main() {
         None => return,
     };
 
-    println!("{:#?}", cfg);
+    debug!("{:#?}", cfg);
 
     match &cfg.backend {
         config::Backend::Memory(s) => {
@@ -60,7 +60,7 @@ async fn main() {
             srv.serve().await.expect("server died with error");
         }
         config::Backend::Netbox(s) => {
-            info!("Using backend Netbox");
+            info!("Using backend Netbox at {}", s.base_url);
             let nb_backend = Netbox::from_cfg(s);
             let mut srv = server::Server::new(nb_backend);
             srv.serve().await.expect("server died with error");
