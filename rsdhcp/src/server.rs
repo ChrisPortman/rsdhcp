@@ -1,15 +1,11 @@
-use std::io::{self, IoSliceMut};
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
-use std::os::fd::{AsRawFd, RawFd};
+use std::io;
+use std::net::{Ipv4Addr, SocketAddrV4};
 use std::sync::Arc;
 
 use chrono::{Duration, Utc};
 use log::{debug, error, info, warn};
-use nix::errno::Errno;
 use nix::ifaddrs::getifaddrs;
-use nix::sys::socket::{ControlMessageOwned, MsgFlags, SockaddrStorage, recvmsg};
 use socket2::{Domain, Protocol, Socket, Type};
-use tokio::io::Interest;
 use tokio::net::UdpSocket;
 
 use crate::backends::{BackendError, DhcpStore, Lease};
@@ -19,16 +15,10 @@ use crate::protocol::{enums, option, packet};
 
 const RECV_BUF_SIZE: usize = 4096;
 
-struct PacketMetadata {
-    length: usize,
-    source: Option<SocketAddr>,
-    destination: Option<Ipv4Addr>,
-    // interface_index: Option<u32>,
-}
-
 struct Packet {
-    meta: PacketMetadata,
     recv_ip: Ipv4Addr,
+    src_ip: Ipv4Addr,
+    length: usize,
     data: [u8; RECV_BUF_SIZE],
 }
 
@@ -122,12 +112,6 @@ impl<T: DhcpStore + Sync + Send + 'static> IPServer<T> {
             return Err(e);
         }
 
-        // enable IP_PKTINFO
-        if let Err(e) = enable_ip_pktinfo(sock.as_raw_fd()) {
-            error!("Could not enable PKTINFO: {}", e);
-            return Err(e);
-        }
-
         let sock_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 67);
         if let Err(e) = sock.bind(&sock_addr.into()) {
             error!("Could not bind to {}: {}", self.iface_name, e);
@@ -152,37 +136,35 @@ impl<T: DhcpStore + Sync + Send + 'static> IPServer<T> {
 
         loop {
             debug!("waiting for packet on {}", self.ip);
-            if let Err(e) = socket_arc.readable().await {
-                error!("error waiting for socket data: {}", e);
-                continue;
-            }
 
-            let meta = match socket_arc.try_io(Interest::READABLE, || {
-                receive_packet(socket_arc.as_raw_fd(), &mut buffer)
-            }) {
-                Ok(meta) => meta,
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+            let (length, src_ip) = match socket_arc.recv_from(&mut buffer).await {
+                Ok((len, src_addr)) => {
+                    let src_ip4_addr = match src_addr.ip() {
+                        std::net::IpAddr::V4(ip) => ip,
+                        _ => {
+                            error!("received packet on IPv4 interface from non IPv4 source");
+                            continue;
+                        }
+                    };
+
+                    (len, src_ip4_addr)
+                }
                 Err(e) => {
                     error!("error reading data from socket: {}", e);
                     continue;
                 }
             };
 
-            info!(
-                "Data received on IP {} from {}",
-                self.ip,
-                meta.source
-                    .map(|a| a.to_string())
-                    .unwrap_or(String::from("unknown")),
-            );
+            info!("Data received on IP {} from {}", self.ip, src_ip,);
 
-            let ip = self.ip;
+            let recv_ip = self.ip;
             let sock = socket_arc.clone();
             let store = self.store.clone();
 
             let packet = Packet {
-                meta,
-                recv_ip: ip,
+                recv_ip,
+                src_ip,
+                length,
                 data: buffer,
             };
 
@@ -194,12 +176,9 @@ impl<T: DhcpStore + Sync + Send + 'static> IPServer<T> {
 
 /// Processes a single UDP datagram containing a DHCP packet.
 async fn process_packet_data<T: DhcpStore>(sock: Arc<UdpSocket>, packet: Packet, store: Arc<T>) {
-    let data = &packet.data[0..packet.meta.length];
+    let data = &packet.data[0..packet.length];
 
-    let broadcast = match packet.meta.destination {
-        Some(dst) => dst.is_broadcast(),
-        None => false,
-    };
+    let broadcast = packet.src_ip.is_unspecified();
 
     let dhcp_packet = match packet::DhcpPacket::from_network(data, broadcast) {
         Ok(p) => p,
@@ -359,68 +338,4 @@ async fn process_packet_data<T: DhcpStore>(sock: Arc<UdpSocket>, packet: Packet,
             }
         );
     }
-}
-
-fn enable_ip_pktinfo(fd: i32) -> Result<(), io::Error> {
-    let enabled: libc::c_int = 1;
-
-    let result = unsafe {
-        libc::setsockopt(
-            fd,
-            libc::IPPROTO_IP,
-            libc::IP_PKTINFO,
-            (&enabled as *const libc::c_int).cast(),
-            std::mem::size_of_val(&enabled) as libc::socklen_t,
-        )
-    };
-
-    if result == -1 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
-}
-
-fn errno_to_io(error: Errno) -> io::Error {
-    io::Error::from_raw_os_error(error as i32)
-}
-
-fn receive_packet(fd: RawFd, buffer: &mut [u8]) -> io::Result<PacketMetadata> {
-    let mut iov = [IoSliceMut::new(buffer)];
-
-    let mut control_buffer = nix::cmsg_space!(libc::in_pktinfo);
-
-    let message = recvmsg::<SockaddrStorage>(
-        fd,
-        &mut iov,
-        Some(&mut control_buffer),
-        MsgFlags::MSG_DONTWAIT,
-    )
-    .map_err(errno_to_io)?;
-
-    let source = message.address.as_ref().and_then(|address| {
-        address
-            .as_sockaddr_in()
-            .map(|address| SocketAddr::V4(SocketAddrV4::new(address.ip(), address.port())))
-    });
-
-    let mut destination = None;
-    // let mut interface_index = None;
-
-    for control_message in message.cmsgs().map_err(errno_to_io)? {
-        if let ControlMessageOwned::Ipv4PacketInfo(packet_info) = control_message {
-            let destination_u32 = u32::from_be(packet_info.ipi_addr.s_addr);
-
-            destination = Some(Ipv4Addr::from(destination_u32.to_be_bytes()));
-
-            // interface_index = Some(packet_info.ipi_ifindex as u32);
-        }
-    }
-
-    Ok(PacketMetadata {
-        length: message.bytes,
-        source,
-        destination,
-        // interface_index,
-    })
 }
