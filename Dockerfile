@@ -6,8 +6,9 @@ RUN cargo build --release
 
 FROM debian:trixie AS environment
 
-RUN apt-get update && apt-get install -y \
-      libssl3 ca-certificates && \
+RUN apt-get update && \
+    apt-get dist-upgrade -y && \
+    apt-get install -y libssl3 ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
